@@ -1,10 +1,72 @@
 import time
+from typing import Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils import cards, levels
+
 VOICE_TICK_MINUTES = 5
+
+
+async def _fetch_bytes(url: str) -> Optional[bytes]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+    except Exception:
+        pass
+    return None
+
+
+async def _get_background(db, guild_id: int, member_row: dict) -> Optional[bytes]:
+    card_id = member_row.get("card_id")
+    if not card_id:
+        return None
+    card = await db.get_card(card_id)
+    if not card:
+        return None
+    return await _fetch_bytes(card["image_url"])
+
+
+async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, level: int, total_gg: int):
+    config = await db.get_guild_config(guild.id)
+    channel_id = config.get("levelup_channel_id")
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return
+    _, gg_into_level, gg_needed = levels.get_progress(total_gg)
+    tier_name = levels.get_tier_name(level)
+    member_row = await db.get_member(guild.id, member.id)
+    background_bytes = await _get_background(db, guild.id, member_row)
+    avatar_bytes = await member.display_avatar.read()
+    buf = cards.render_levelup_card(
+        member.display_name, avatar_bytes, level, tier_name,
+        gg_into_level, gg_needed, background_bytes
+    )
+    try:
+        await channel.send(
+            content=f"🎉 {member.mention} just reached **Goblin Grade {level}**!",
+            file=discord.File(buf, filename="levelup.png")
+        )
+    except discord.HTTPException:
+        pass
+
+
+async def _award_gg(db, guild: discord.Guild, member: discord.Member, amount: int):
+    if amount <= 0:
+        return
+    before = await db.get_member(guild.id, member.id)
+    old_level = levels.get_level(before["gg"])
+    new_total = await db.add_gg(guild.id, member.id, amount)
+    new_level = levels.get_level(new_total)
+    if new_level > old_level:
+        await _announce_levelup(db, guild, member, new_level, new_total)
 
 
 class UpdateGroup(app_commands.Group):
@@ -13,9 +75,9 @@ class UpdateGroup(app_commands.Group):
         self.db = db
 
     async def card_autocomplete(self, interaction: discord.Interaction, current: str):
-        cards = await self.db.get_library_cards(interaction.guild.id)
+        available = await self.db.get_library_cards(interaction.guild.id)
         current = current.lower()
-        matches = [c for c in cards if current in c["name"].lower()]
+        matches = [c for c in available if current in c["name"].lower()]
         return [
             app_commands.Choice(name=c["name"], value=str(c["id"]))
             for c in matches[:25]
@@ -57,19 +119,21 @@ class PatronGroup(app_commands.Group):
         )
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="rank", description="Show a patron's Goblin Gold rank.")
+    @app_commands.command(name="rank", description="Show a patron's Goblin Gold rank card.")
     @app_commands.describe(member="Whose rank to check (defaults to you)")
     async def rank(self, interaction: discord.Interaction, member: discord.Member = None):
         target = member or interaction.user
+        await interaction.response.defer()
         stats = await self.db.get_member(interaction.guild.id, target.id)
         placement = await self.db.get_rank(interaction.guild.id, target.id)
-        embed = discord.Embed(
-            title=f"{target.display_name}'s Library Record",
-            color=discord.Color.gold()
+        level, gg_into_level, gg_needed = levels.get_progress(stats["gg"])
+        avatar_bytes = await target.display_avatar.read()
+        background_bytes = await _get_background(self.db, interaction.guild.id, stats)
+        buf = cards.render_rank_card(
+            target.display_name, avatar_bytes, level, placement,
+            gg_into_level, gg_needed, background_bytes
         )
-        embed.add_field(name="Rank", value=f"#{placement}" if placement else "Unranked", inline=True)
-        embed.add_field(name="Goblin Gold", value=str(stats["gg"]), inline=True)
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
 
     @app_commands.command(name="library-card", description="Show a patron's library card.")
     @app_commands.describe(member="Whose card to view (defaults to you)")
@@ -99,7 +163,7 @@ class AddGroup(app_commands.Group):
     @app_commands.command(name="member", description="Give Goblin Gold to a member.")
     @app_commands.describe(member="Who to give GG to", amount="How much GG to give")
     async def member(self, interaction: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1]):
-        await self.db.add_gg(interaction.guild.id, member.id, amount)
+        await _award_gg(self.db, interaction.guild, member, amount)
         await interaction.response.send_message(f"✅ Gave **{amount} GG** to {member.mention}.")
 
     @app_commands.command(name="library-card", description="Add a new library card design to the catalog.")
@@ -147,6 +211,18 @@ class SetRateGroup(app_commands.Group):
         )
 
 
+class ChannelSetGroup(app_commands.Group):
+    def __init__(self, db):
+        super().__init__(name="channelset", description="Configure channels Griffin posts to")
+        self.db = db
+
+    @app_commands.command(name="levelup", description="Set the channel for level-up announcements.")
+    @app_commands.describe(channel="Channel to post level-up cards in")
+    async def levelup(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await self.db.set_levelup_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ Level-up announcements will post in {channel.mention}.")
+
+
 class GGGroup(app_commands.Group):
     def __init__(self, db):
         super().__init__(
@@ -157,6 +233,7 @@ class GGGroup(app_commands.Group):
         self.db = db
         self.add_command(AddGroup(db))
         self.add_command(SetRateGroup(db))
+        self.add_command(ChannelSetGroup(db))
 
     @app_commands.command(name="remove", description="Remove Goblin Gold from a member.")
     @app_commands.describe(member="Who to remove GG from", amount="How much GG to remove")
@@ -188,8 +265,7 @@ class Economy(commands.Cog):
         if last is not None and now - last < config["message_cooldown"]:
             return
         self._message_cooldowns[key] = now
-        if config["message_rate"] > 0:
-            await self.db.add_gg(message.guild.id, message.author.id, config["message_rate"])
+        await _award_gg(self.db, message.guild, message.author, config["message_rate"])
 
     @tasks.loop(minutes=VOICE_TICK_MINUTES)
     async def voice_tick(self):
@@ -207,7 +283,7 @@ class Economy(commands.Cog):
                         continue
                     if member.voice and member.voice.self_deaf:
                         continue
-                    await self.db.add_gg(guild.id, member.id, amount)
+                    await _award_gg(self.db, guild, member, amount)
 
     @voice_tick.before_loop
     async def before_voice_tick(self):

@@ -66,7 +66,8 @@ class Database:
                 message_rate INTEGER NOT NULL DEFAULT 25,
                 message_cooldown INTEGER NOT NULL DEFAULT 30,
                 voice_rate INTEGER NOT NULL DEFAULT 25,
-                voice_interval INTEGER NOT NULL DEFAULT 3600
+                voice_interval INTEGER NOT NULL DEFAULT 3600,
+                levelup_channel_id BIGINT
             )
         """)
 
@@ -81,13 +82,15 @@ class Database:
         )
         return row or {"gg": 0, "card_id": None}
 
-    async def add_gg(self, guild_id: int, user_id: int, amount: int):
-        await self._execute("""
+    async def add_gg(self, guild_id: int, user_id: int, amount: int) -> int:
+        row = await self._fetchone("""
             INSERT INTO members (guild_id, user_id, gg)
             VALUES (%s, %s, %s)
             ON CONFLICT (guild_id, user_id)
             DO UPDATE SET gg = members.gg + %s
+            RETURNING gg
         """, guild_id, user_id, amount, amount)
+        return row["gg"]
 
     async def remove_gg(self, guild_id: int, user_id: int, amount: int):
         await self._execute("""
@@ -146,7 +149,7 @@ class Database:
 
     async def get_guild_config(self, guild_id: int) -> dict:
         row = await self._fetchone(
-            "SELECT message_rate, message_cooldown, voice_rate, voice_interval "
+            "SELECT message_rate, message_cooldown, voice_rate, voice_interval, levelup_channel_id "
             "FROM guild_config WHERE guild_id = %s",
             guild_id
         )
@@ -157,7 +160,16 @@ class Database:
             "message_cooldown": DEFAULT_MESSAGE_COOLDOWN,
             "voice_rate": DEFAULT_VOICE_RATE,
             "voice_interval": DEFAULT_VOICE_INTERVAL,
+            "levelup_channel_id": None,
         }
+
+    async def set_levelup_channel(self, guild_id: int, channel_id: int):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, levelup_channel_id)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET levelup_channel_id = %s
+        """, guild_id, channel_id, channel_id)
 
     async def set_message_rate(self, guild_id: int, amount: int, cooldown: int):
         await self._execute("""
