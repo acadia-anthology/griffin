@@ -10,6 +10,7 @@ load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True
 
 
 class Griffin(commands.Bot):
@@ -40,6 +41,7 @@ class Griffin(commands.Bot):
         await self.db.initialize()
         cogs = [
             "cogs.core",
+            "cogs.economy",
         ]
         for cog in cogs:
             await self.load_extension(cog)
@@ -50,10 +52,7 @@ class Griffin(commands.Bot):
     async def on_ready(self):
         print(f"✨ Griffin is online as {self.user} (ID: {self.user.id})", flush=True)
         await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="the stacks 📚"
-            )
+            activity=discord.CustomActivity(name="Griffin is causing chaos...")
         )
 
 
