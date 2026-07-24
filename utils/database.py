@@ -45,9 +45,19 @@ class Database:
             CREATE TABLE IF NOT EXISTS members (
                 guild_id BIGINT NOT NULL,
                 user_id BIGINT NOT NULL,
-                gg_balance INTEGER NOT NULL DEFAULT 0,
-                gg_earned INTEGER NOT NULL DEFAULT 0,
+                gg INTEGER NOT NULL DEFAULT 0,
+                card_id INTEGER,
                 PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS library_cards (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                image_url TEXT NOT NULL,
+                added_by BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
         """)
         await self._execute("""
@@ -61,50 +71,38 @@ class Database:
         """)
 
     # --- members / GG ---
-    # gg_earned is lifetime GG earned (never decreases from spending) and drives
-    # rank/leaderboard. gg_balance is spendable and drops when a patron buys
-    # something. /gg add and /gg remove touch both, since those are corrections
-    # to how much GG someone has actually earned, not purchases.
+    # GG is purely cosmetic (rank + bragging rights) — nothing spends it, so
+    # it's a single running total, not a balance/earned split.
 
     async def get_member(self, guild_id: int, user_id: int) -> dict:
         row = await self._fetchone(
-            "SELECT gg_balance, gg_earned FROM members WHERE guild_id = %s AND user_id = %s",
+            "SELECT gg, card_id FROM members WHERE guild_id = %s AND user_id = %s",
             guild_id, user_id
         )
-        return row or {"gg_balance": 0, "gg_earned": 0}
+        return row or {"gg": 0, "card_id": None}
 
     async def add_gg(self, guild_id: int, user_id: int, amount: int):
         await self._execute("""
-            INSERT INTO members (guild_id, user_id, gg_balance, gg_earned)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO members (guild_id, user_id, gg)
+            VALUES (%s, %s, %s)
             ON CONFLICT (guild_id, user_id)
-            DO UPDATE SET gg_balance = members.gg_balance + %s,
-                          gg_earned = members.gg_earned + %s
-        """, guild_id, user_id, amount, amount, amount, amount)
+            DO UPDATE SET gg = members.gg + %s
+        """, guild_id, user_id, amount, amount)
 
     async def remove_gg(self, guild_id: int, user_id: int, amount: int):
         await self._execute("""
-            INSERT INTO members (guild_id, user_id, gg_balance, gg_earned)
-            VALUES (%s, %s, 0, 0)
+            INSERT INTO members (guild_id, user_id, gg)
+            VALUES (%s, %s, 0)
             ON CONFLICT (guild_id, user_id)
-            DO UPDATE SET gg_balance = GREATEST(members.gg_balance - %s, 0),
-                          gg_earned = GREATEST(members.gg_earned - %s, 0)
-        """, guild_id, user_id, amount, amount)
-
-    async def spend_gg(self, guild_id: int, user_id: int, amount: int) -> bool:
-        row = await self._fetchone("""
-            UPDATE members SET gg_balance = gg_balance - %s
-            WHERE guild_id = %s AND user_id = %s AND gg_balance >= %s
-            RETURNING gg_balance
-        """, amount, guild_id, user_id, amount)
-        return row is not None
+            DO UPDATE SET gg = GREATEST(members.gg - %s, 0)
+        """, guild_id, user_id, amount)
 
     async def get_leaderboard(self, guild_id: int) -> list:
         return await self._fetchall("""
-            SELECT user_id, gg_balance, gg_earned
+            SELECT user_id, gg
             FROM members
-            WHERE guild_id = %s AND gg_earned > 0
-            ORDER BY gg_earned DESC
+            WHERE guild_id = %s AND gg > 0
+            ORDER BY gg DESC
         """, guild_id)
 
     async def get_rank(self, guild_id: int, user_id: int) -> Optional[int]:
@@ -113,6 +111,36 @@ class Database:
             if row["user_id"] == user_id:
                 return i
         return None
+
+    # --- library cards ---
+
+    async def add_library_card(self, guild_id: int, name: str, image_url: str, added_by: int) -> int:
+        row = await self._fetchone("""
+            INSERT INTO library_cards (guild_id, name, image_url, added_by)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+        """, guild_id, name, image_url, added_by)
+        return row["id"]
+
+    async def get_library_cards(self, guild_id: int) -> list:
+        return await self._fetchall("""
+            SELECT id, name, image_url FROM library_cards
+            WHERE guild_id = %s ORDER BY name
+        """, guild_id)
+
+    async def get_card(self, card_id: int) -> Optional[dict]:
+        return await self._fetchone(
+            "SELECT id, name, image_url FROM library_cards WHERE id = %s",
+            card_id
+        )
+
+    async def set_member_card(self, guild_id: int, user_id: int, card_id: int):
+        await self._execute("""
+            INSERT INTO members (guild_id, user_id, card_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET card_id = %s
+        """, guild_id, user_id, card_id, card_id)
 
     # --- guild config / earn rates ---
 

@@ -7,10 +7,37 @@ from discord.ext import commands, tasks
 VOICE_TICK_MINUTES = 5
 
 
+class UpdateGroup(app_commands.Group):
+    def __init__(self, db):
+        super().__init__(name="update", description="Update your own profile")
+        self.db = db
+
+    async def card_autocomplete(self, interaction: discord.Interaction, current: str):
+        cards = await self.db.get_library_cards(interaction.guild.id)
+        current = current.lower()
+        matches = [c for c in cards if current in c["name"].lower()]
+        return [
+            app_commands.Choice(name=c["name"], value=str(c["id"]))
+            for c in matches[:25]
+        ]
+
+    @app_commands.command(name="library-card", description="Choose your library card design.")
+    @app_commands.describe(card="Which card to use")
+    @app_commands.autocomplete(card=card_autocomplete)
+    async def library_card(self, interaction: discord.Interaction, card: str):
+        card_row = await self.db.get_card(int(card))
+        if card_row is None:
+            await interaction.response.send_message("❌ That card doesn't exist anymore. Pick another.", ephemeral=True)
+            return
+        await self.db.set_member_card(interaction.guild.id, interaction.user.id, card_row["id"])
+        await interaction.response.send_message(f"✅ Library card set to **{card_row['name']}**.")
+
+
 class PatronGroup(app_commands.Group):
     def __init__(self, db):
         super().__init__(name="patron", description="Goblin Gold & library card commands")
         self.db = db
+        self.add_command(UpdateGroup(db))
 
     @app_commands.command(name="board", description="Show the Goblin Gold leaderboard.")
     async def board(self, interaction: discord.Interaction):
@@ -22,7 +49,7 @@ class PatronGroup(app_commands.Group):
         for i, row in enumerate(rows, start=1):
             member = interaction.guild.get_member(row["user_id"])
             name = member.display_name if member else f"<@{row['user_id']}>"
-            lines.append(f"**{i}.** {name} — {row['gg_earned']} GG")
+            lines.append(f"**{i}.** {name} — {row['gg']} GG")
         embed = discord.Embed(
             title="📚 Goblin Gold Leaderboard",
             description="\n".join(lines),
@@ -41,8 +68,7 @@ class PatronGroup(app_commands.Group):
             color=discord.Color.gold()
         )
         embed.add_field(name="Rank", value=f"#{placement}" if placement else "Unranked", inline=True)
-        embed.add_field(name="Goblin Gold Earned", value=str(stats["gg_earned"]), inline=True)
-        embed.add_field(name="Spendable Balance", value=str(stats["gg_balance"]), inline=True)
+        embed.add_field(name="Goblin Gold", value=str(stats["gg"]), inline=True)
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="library-card", description="Show a patron's library card.")
@@ -56,17 +82,31 @@ class PatronGroup(app_commands.Group):
             color=discord.Color.gold()
         )
         embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(name="Goblin Gold", value=str(stats["gg_balance"]))
+        embed.add_field(name="Goblin Gold", value=str(stats["gg"]))
+        if stats["card_id"]:
+            card = await self.db.get_card(stats["card_id"])
+            if card:
+                embed.set_image(url=card["image_url"])
+                embed.add_field(name="Card", value=card["name"])
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="library-card-shop", description="Browse library card backgrounds.")
-    async def library_card_shop(self, interaction: discord.Interaction):
-        embed = discord.Embed(
-            title="🖼️ Library Card Shop",
-            description="The shop is still being stocked — check back soon!",
-            color=discord.Color.gold()
-        )
-        await interaction.response.send_message(embed=embed)
+
+class AddGroup(app_commands.Group):
+    def __init__(self, db):
+        super().__init__(name="add", description="Add GG or a new library card")
+        self.db = db
+
+    @app_commands.command(name="member", description="Give Goblin Gold to a member.")
+    @app_commands.describe(member="Who to give GG to", amount="How much GG to give")
+    async def member(self, interaction: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1]):
+        await self.db.add_gg(interaction.guild.id, member.id, amount)
+        await interaction.response.send_message(f"✅ Gave **{amount} GG** to {member.mention}.")
+
+    @app_commands.command(name="library-card", description="Add a new library card design to the catalog.")
+    @app_commands.describe(name="Name for this card", image="The card artwork")
+    async def library_card(self, interaction: discord.Interaction, name: str, image: discord.Attachment):
+        await self.db.add_library_card(interaction.guild.id, name, image.url, interaction.user.id)
+        await interaction.response.send_message(f"✅ Added library card **{name}** to the catalog.")
 
 
 class SetRateGroup(app_commands.Group):
@@ -115,13 +155,8 @@ class GGGroup(app_commands.Group):
             default_permissions=discord.Permissions(manage_guild=True)
         )
         self.db = db
+        self.add_command(AddGroup(db))
         self.add_command(SetRateGroup(db))
-
-    @app_commands.command(name="add", description="Give Goblin Gold to a member.")
-    @app_commands.describe(member="Who to give GG to", amount="How much GG to give")
-    async def add(self, interaction: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1]):
-        await self.db.add_gg(interaction.guild.id, member.id, amount)
-        await interaction.response.send_message(f"✅ Gave **{amount} GG** to {member.mention}.")
 
     @app_commands.command(name="remove", description="Remove Goblin Gold from a member.")
     @app_commands.describe(member="Who to remove GG from", amount="How much GG to remove")
