@@ -171,22 +171,25 @@ class LibraryCardPicker(discord.ui.View):
         self.index = (self.index + 1) % len(self.available)
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-
-class UpdateGroup(app_commands.Group):
-    def __init__(self, db):
-        super().__init__(name="update", description="Update your own profile")
-        self.db = db
-
-    @app_commands.command(name="profile", description="Edit your library card bio, genres, and checked-out books.")
-    async def profile(self, interaction: discord.Interaction):
-        stats = await self.db.get_member(interaction.guild.id, interaction.user.id)
+    @discord.ui.button(label="✏️ Edit Details", style=discord.ButtonStyle.primary)
+    async def edit_details(self, interaction: discord.Interaction, button: discord.ui.Button):
+        stats = await self.db.get_member(self.guild_id, self.user_id)
         modal = ProfileModal(
             self.db, stats.get("bio") or "", stats.get("favorite_genres") or "",
             stats.get("books_checked_out") or ""
         )
         await interaction.response.send_modal(modal)
 
-    @app_commands.command(name="library-card", description="Browse and choose your library card design.")
+
+class UpdateGroup(app_commands.Group):
+    def __init__(self, db):
+        super().__init__(name="update", description="Update your own profile")
+        self.db = db
+
+    @app_commands.command(
+        name="library-card",
+        description="Browse/choose your library card design and edit its bio, genres, and checked-out books."
+    )
     async def library_card(self, interaction: discord.Interaction):
         available = await self.db.get_library_cards(interaction.guild.id)
         if not available:
