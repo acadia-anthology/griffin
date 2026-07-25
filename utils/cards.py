@@ -35,6 +35,16 @@ def s(value: int) -> int:
     return round(value * SCALE)
 
 
+def parse_hex_color(value: str) -> Optional[tuple]:
+    value = value.strip().lstrip("#")
+    if len(value) != 6:
+        return None
+    try:
+        return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
 def _font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
     try:
         font = ImageFont.truetype(FONT_PATH, size)
@@ -44,7 +54,7 @@ def _font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default(size=size)
 
 
-def _circular_avatar(avatar_bytes: bytes, size: int, ring_width: int = 4) -> Image.Image:
+def _circular_avatar(avatar_bytes: bytes, size: int, ring_width: int = 4, ring_color=GOLD) -> Image.Image:
     avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((size, size))
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
@@ -53,7 +63,7 @@ def _circular_avatar(avatar_bytes: bytes, size: int, ring_width: int = 4) -> Ima
     ring = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     ImageDraw.Draw(ring).ellipse(
         (ring_width // 2, ring_width // 2, size - ring_width // 2, size - ring_width // 2),
-        outline=GOLD, width=ring_width
+        outline=ring_color, width=ring_width
     )
     return Image.alpha_composite(out, ring)
 
@@ -67,14 +77,14 @@ def _rounded_triangle(width: int, height: int, fill, supersample: int = 4) -> Im
     return big.resize((width, height), Image.LANCZOS)
 
 
-def _progress_bar(draw: ImageDraw.ImageDraw, box, ratio: float, bar_bg):
+def _progress_bar(draw: ImageDraw.ImageDraw, box, ratio: float, bar_bg, fill_color=BAR_FILL):
     x0, y0, x1, y1 = box
     radius = (y1 - y0) // 2
     draw.rounded_rectangle(box, radius=radius, fill=bar_bg)
     ratio = max(0.0, min(1.0, ratio))
     if ratio > 0:
         fill_x1 = max(x0 + int((x1 - x0) * ratio), x0 + (y1 - y0))
-        draw.rounded_rectangle((x0, y0, min(fill_x1, x1), y1), radius=radius, fill=BAR_FILL)
+        draw.rounded_rectangle((x0, y0, min(fill_x1, x1), y1), radius=radius, fill=fill_color)
 
 
 def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) -> Image.Image:
@@ -105,23 +115,25 @@ def _gg_text(gg_into_level: int, gg_needed: int) -> str:
 
 def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[int],
                       gg_into_level: int, gg_needed: int,
-                      background_bytes: Optional[bytes] = None) -> io.BytesIO:
+                      background_bytes: Optional[bytes] = None,
+                      accent_color: Optional[tuple] = None) -> io.BytesIO:
+    accent = accent_color or GOLD
     W, H = s(480), s(130)
     img = _base_canvas(W, H, RANK_BG, background_bytes)
     draw = ImageDraw.Draw(img)
 
     avatar_size = s(85)
-    avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4))
+    avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4), ring_color=accent)
     img.paste(avatar, (W - avatar_size - s(18), (H - avatar_size) // 2), avatar)
 
     text_x = s(18)
-    draw.text((text_x, s(12)), name, font=_font(True, s(20)), fill=GOLD)
+    draw.text((text_x, s(12)), name, font=_font(True, s(20)), fill=accent)
     draw.text((text_x, s(38)), f"LEVEL: {level}", font=_font(True, s(15)), fill=WHITE)
 
     ratio = (gg_into_level / gg_needed) if gg_needed else 1.0
     bar_right = W - avatar_size - s(36)
     bar_box = (text_x, s(66), bar_right, s(76))
-    _progress_bar(draw, bar_box, ratio, RANK_BAR_BG)
+    _progress_bar(draw, bar_box, ratio, RANK_BAR_BG, fill_color=accent)
 
     rank_text = f"RANK: {rank}" if rank else "RANK: Unranked"
     draw.text((text_x, s(84)), rank_text, font=_font(False, s(12)), fill=WHITE)
@@ -137,7 +149,9 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
 
 
 def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_level: int,
-                         background_bytes: Optional[bytes] = None) -> io.BytesIO:
+                         background_bytes: Optional[bytes] = None,
+                         accent_color: Optional[tuple] = None) -> io.BytesIO:
+    accent = accent_color or GOLD
     W, H = s(780), s(220)
     pill_radius = H // 2
 
@@ -153,7 +167,7 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
 
     avatar_size = s(120)
     avatar_x = W - avatar_size - s(45)
-    avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4))
+    avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4), ring_color=accent)
     img.paste(avatar, (avatar_x, (H - avatar_size) // 2), avatar)
 
     text_x = s(60)
@@ -177,7 +191,7 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
     levelup_y = levelup_ink_top - levelup_bbox[1]
     levelup_center_y = levelup_ink_top + levelup_h // 2
 
-    draw.text((text_x, name_y), name, font=name_font, fill=GOLD)
+    draw.text((text_x, name_y), name, font=name_font, fill=accent)
     draw.text((text_x, levelup_y), "LEVEL UP!", font=levelup_font, fill=WHITE)
 
     # transition badge: "{old level} ▶ {new level}", aligned to the
@@ -211,10 +225,10 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
     # resample filter softens the corners instead of hard polygon points.
     tri_h = text_h // 2
     tri_mid_y = badge_y + pad_y + text_h // 2
-    triangle = _rounded_triangle(arrow_w, tri_h, GOLD)
+    triangle = _rounded_triangle(arrow_w, tri_h, accent)
     img.paste(triangle, (cx, tri_mid_y - tri_h // 2), triangle)
     cx += arrow_w + gap
-    draw.text((cx, cy), new_text, font=num_font, fill=GOLD)
+    draw.text((cx, cy), new_text, font=num_font, fill=accent)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")

@@ -1,3 +1,4 @@
+import io
 import time
 from typing import Optional
 
@@ -22,14 +23,17 @@ async def _fetch_bytes(url: str) -> Optional[bytes]:
     return None
 
 
-async def _get_background(db, guild_id: int, member_row: dict) -> Optional[bytes]:
+async def _get_card_visuals(db, guild_id: int, member_row: dict):
+    """Returns (background_bytes, accent_color) for the member's equipped card, or (None, None)."""
     card_id = member_row.get("card_id")
     if not card_id:
-        return None
+        return None, None
     card = await db.get_card(card_id)
     if not card:
-        return None
-    return await _fetch_bytes(card["image_url"])
+        return None, None
+    background_bytes = await _fetch_bytes(card["image_url"])
+    accent_color = cards.parse_hex_color(card["accent_color"]) if card.get("accent_color") else None
+    return background_bytes, accent_color
 
 
 async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, old_level: int, new_level: int):
@@ -41,10 +45,10 @@ async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, ol
     if channel is None:
         return
     member_row = await db.get_member(guild.id, member.id)
-    background_bytes = await _get_background(db, guild.id, member_row)
+    background_bytes, accent_color = await _get_card_visuals(db, guild.id, member_row)
     avatar_bytes = await member.display_avatar.read()
     buf = cards.render_levelup_card(
-        member.display_name, avatar_bytes, old_level, new_level, background_bytes
+        member.display_name, avatar_bytes, old_level, new_level, background_bytes, accent_color
     )
     try:
         await channel.send(
@@ -125,10 +129,10 @@ class PatronGroup(app_commands.Group):
         placement = await self.db.get_rank(interaction.guild.id, target.id)
         level, gg_into_level, gg_needed = levels.get_progress(stats["gg"])
         avatar_bytes = await target.display_avatar.read()
-        background_bytes = await _get_background(self.db, interaction.guild.id, stats)
+        background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
         buf = cards.render_rank_card(
             target.display_name, avatar_bytes, level, placement,
-            gg_into_level, gg_needed, background_bytes
+            gg_into_level, gg_needed, background_bytes, accent_color
         )
         await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
 
@@ -164,10 +168,46 @@ class AddGroup(app_commands.Group):
         await interaction.response.send_message(f"✅ Gave **{amount} GG** to {member.mention}.")
 
     @app_commands.command(name="library-card", description="Add a new library card design to the catalog.")
-    @app_commands.describe(name="Name for this card", image="The card artwork")
-    async def library_card(self, interaction: discord.Interaction, name: str, image: discord.Attachment):
-        await self.db.add_library_card(interaction.guild.id, name, image.url, interaction.user.id)
-        await interaction.response.send_message(f"✅ Added library card **{name}** to the catalog.")
+    @app_commands.describe(
+        name="Name for this card",
+        image="The card artwork",
+        accent_color="Hex accent color for this card, e.g. #c9ad6a (optional — defaults to standard gold)"
+    )
+    async def library_card(self, interaction: discord.Interaction, name: str, image: discord.Attachment,
+                            accent_color: str = None):
+        if accent_color and cards.parse_hex_color(accent_color) is None:
+            await interaction.response.send_message(
+                "❌ That doesn't look like a hex color. Use a format like `#c9ad6a`.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        config = await self.db.get_guild_config(interaction.guild.id)
+        assets_channel_id = config.get("assets_channel_id")
+        image_url = image.url
+        archived = False
+        if assets_channel_id:
+            channel = interaction.guild.get_channel(assets_channel_id)
+            if channel:
+                try:
+                    data = await image.read()
+                    msg = await channel.send(
+                        content=f"📇 **{name}** — added by {interaction.user.mention}",
+                        file=discord.File(io.BytesIO(data), filename=image.filename)
+                    )
+                    if msg.attachments:
+                        image_url = msg.attachments[0].url
+                        archived = True
+                except discord.HTTPException:
+                    pass
+
+        stored_color = accent_color.strip().lstrip("#") if accent_color else None
+        await self.db.add_library_card(interaction.guild.id, name, image_url, interaction.user.id, stored_color)
+        note = "" if archived else (
+            "\n⚠️ No assets channel set, so this uses the original upload link, which may not stay "
+            "valid long-term. Set one with `/gg channelset assets`."
+        )
+        await interaction.followup.send(f"✅ Added library card **{name}** to the catalog.{note}")
 
 
 class SetRateGroup(app_commands.Group):
@@ -218,6 +258,12 @@ class ChannelSetGroup(app_commands.Group):
     async def levelup(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await self.db.set_levelup_channel(interaction.guild.id, channel.id)
         await interaction.response.send_message(f"✅ Level-up announcements will post in {channel.mention}.")
+
+    @app_commands.command(name="assets", description="Set the channel uploaded card art gets archived to.")
+    @app_commands.describe(channel="Channel to repost card art in for stable, permanent links")
+    async def assets(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await self.db.set_assets_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ Card art will be archived in {channel.mention}.")
 
 
 class GGGroup(app_commands.Group):
