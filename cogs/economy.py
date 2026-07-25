@@ -180,17 +180,50 @@ class LibraryCardPicker(discord.ui.View):
         )
         await interaction.response.send_modal(modal)
 
+    @discord.ui.button(label="🗑️ Remove Card", style=discord.ButtonStyle.danger)
+    async def remove_card(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.db.clear_member_card(self.guild_id, self.user_id)
+        for child in self.children:
+            child.disabled = True
+        embed = discord.Embed(
+            title="Library card removed",
+            description="Back to the default look.",
+            color=discord.Color.greyple()
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
 
-class UpdateGroup(app_commands.Group):
+
+class LibraryCardGroup(app_commands.Group):
     def __init__(self, db):
-        super().__init__(name="update", description="Update your own profile")
+        super().__init__(name="library-card", description="View or update a library card")
         self.db = db
 
+    @app_commands.command(name="view", description="Show a patron's library card.")
+    @app_commands.describe(member="Whose card to view (defaults to you)")
+    async def view(self, interaction: discord.Interaction, member: discord.Member = None):
+        target = member or interaction.user
+        await interaction.response.defer()
+        stats = await self.db.get_member(interaction.guild.id, target.id)
+        placement = await self.db.get_rank(interaction.guild.id, target.id)
+        level = levels.get_level(stats["gg"])
+        display_name = cards.sanitize_name(target.display_name, target.name)
+        avatar_bytes = await target.display_avatar.read()
+        background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
+        member_since = target.joined_at.strftime("%B %d, %Y") if target.joined_at else "Unknown"
+        buf = cards.render_library_card(
+            display_name, avatar_bytes, level, placement, stats["gg"], member_since,
+            stats.get("bio"), stats.get("favorite_genres"), stats.get("books_checked_out"),
+            birthday=None,  # not implemented yet — always hidden until that feature lands
+            background_bytes=background_bytes, accent_color=accent_color
+        )
+        await interaction.followup.send(file=discord.File(buf, filename="library-card.png"))
+
     @app_commands.command(
-        name="library-card",
+        name="update",
         description="Browse/choose your library card design and edit its bio, genres, and checked-out books."
     )
-    async def library_card(self, interaction: discord.Interaction):
+    async def update(self, interaction: discord.Interaction):
         available = await self.db.get_library_cards(interaction.guild.id)
         if not available:
             await interaction.response.send_message("No library cards have been added yet.", ephemeral=True)
@@ -204,7 +237,7 @@ class PatronGroup(app_commands.Group):
     def __init__(self, db):
         super().__init__(name="patron", description="Goblin Gold & library card commands")
         self.db = db
-        self.add_command(UpdateGroup(db))
+        self.add_command(LibraryCardGroup(db))
 
     @app_commands.command(name="board", description="Show the Goblin Gold leaderboard.")
     async def board(self, interaction: discord.Interaction):
@@ -240,26 +273,6 @@ class PatronGroup(app_commands.Group):
             stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color
         )
         await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
-
-    @app_commands.command(name="library-card", description="Show a patron's library card.")
-    @app_commands.describe(member="Whose card to view (defaults to you)")
-    async def library_card(self, interaction: discord.Interaction, member: discord.Member = None):
-        target = member or interaction.user
-        await interaction.response.defer()
-        stats = await self.db.get_member(interaction.guild.id, target.id)
-        placement = await self.db.get_rank(interaction.guild.id, target.id)
-        level = levels.get_level(stats["gg"])
-        display_name = cards.sanitize_name(target.display_name, target.name)
-        avatar_bytes = await target.display_avatar.read()
-        background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
-        member_since = target.joined_at.strftime("%B %d, %Y") if target.joined_at else "Unknown"
-        buf = cards.render_library_card(
-            display_name, avatar_bytes, level, placement, stats["gg"], member_since,
-            stats.get("bio"), stats.get("favorite_genres"), stats.get("books_checked_out"),
-            birthday=None,  # not implemented yet — always hidden until that feature lands
-            background_bytes=background_bytes, accent_color=accent_color
-        )
-        await interaction.followup.send(file=discord.File(buf, filename="library-card.png"))
 
 
 class AddGroup(app_commands.Group):

@@ -35,6 +35,10 @@ GOLD = (201, 173, 106)
 WHITE = (225, 225, 225)
 BAR_FILL = GOLD
 
+# Matches assets/default_background.png — used as the accent whenever a card
+# has no custom accent_color of its own (including the bot-wide default).
+DEFAULT_ACCENT = (57, 181, 74)  # #39b54a
+
 # The two cards are deliberately different sizes and shades — level-up is the
 # big celebratory one, rank is a small compact status readout. Discord scales
 # attachment previews to a shared width, so the *pixel* dimensions (not just
@@ -177,7 +181,7 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
                       total_gg: int, gg_into_level: int, gg_needed: int,
                       background_bytes: Optional[bytes] = None,
                       accent_color: Optional[tuple] = None) -> io.BytesIO:
-    accent = accent_color or GOLD
+    accent = accent_color or DEFAULT_ACCENT
     W, H = s(480), s(130)
     img = _base_canvas(W, H, RANK_BG, background_bytes)
     draw = ImageDraw.Draw(img)
@@ -211,7 +215,7 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
 def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_level: int,
                          background_bytes: Optional[bytes] = None,
                          accent_color: Optional[tuple] = None) -> io.BytesIO:
-    accent = accent_color or GOLD
+    accent = accent_color or DEFAULT_ACCENT
     W, H = s(780), s(122)
     pill_radius = H // 2
 
@@ -325,7 +329,7 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
     """Taller than the rank/level-up cards and variable height — the bottom
     grows to fit the bio/genres text, so layout is computed twice: once on a
     throwaway canvas to measure total height, then for real once H is known."""
-    accent = accent_color or GOLD
+    accent = accent_color or DEFAULT_ACCENT
     W = s(700)
     pad_x = s(40)
     content_w = W - pad_x * 2

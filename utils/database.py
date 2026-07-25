@@ -173,6 +173,14 @@ class Database:
             DO UPDATE SET card_id = %s
         """, guild_id, user_id, card_id, card_id)
 
+    async def clear_member_card(self, guild_id: int, user_id: int):
+        await self._execute("""
+            INSERT INTO members (guild_id, user_id, card_id)
+            VALUES (%s, %s, NULL)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET card_id = NULL
+        """, guild_id, user_id)
+
     # --- guild config / earn rates ---
 
     async def get_guild_config(self, guild_id: int) -> dict:
