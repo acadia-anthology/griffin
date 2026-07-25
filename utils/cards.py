@@ -20,9 +20,8 @@ BAR_FILL = GOLD
 # relative proportions) need a real gap or they read as the same size in-chat.
 RANK_BG = (35, 35, 34)
 RANK_BAR_BG = (75, 75, 72)
-
-LEVELUP_BG = (74, 73, 69)
-LEVELUP_BAR_BG = (110, 109, 104)
+BADGE_BG = (20, 20, 19)
+BADGE_OLD = (150, 150, 148)
 
 # Every render function below is laid out in "logical" pixels, then scaled up
 # before drawing. Discord doesn't upscale small attachments to fill the chat
@@ -125,30 +124,67 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
     return buf
 
 
-def render_levelup_card(name: str, avatar_bytes: bytes, level: int, tier_name: str,
-                         gg_into_level: int, gg_needed: int,
+def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_level: int,
                          background_bytes: Optional[bytes] = None) -> io.BytesIO:
-    W, H = s(780), s(300)
-    img = _base_canvas(W, H, LEVELUP_BG, background_bytes)
+    W, H = s(780), s(220)
+    pill_radius = H // 2
+
+    # Same background/accent treatment as the rank card — the two are meant
+    # to read as one family, differentiated by shape (pill vs rectangle) and
+    # content, not by separate color palettes.
+    base = _base_canvas(W, H, RANK_BG, background_bytes).convert("RGBA")
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), radius=pill_radius, fill=255)
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    img.paste(base, (0, 0), mask)
     draw = ImageDraw.Draw(img)
 
-    avatar_size = s(200)
+    avatar_size = s(150)
+    avatar_x = W - avatar_size - s(45)
     avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4))
-    img.paste(avatar, (W - avatar_size - s(35), (H - avatar_size) // 2), avatar)
+    img.paste(avatar, (avatar_x, (H - avatar_size) // 2), avatar)
 
-    text_x = s(35)
-    draw.text((text_x, s(30)), name, font=_font(True, s(42)), fill=GOLD)
-    draw.text((text_x, s(82)), tier_name, font=_font(False, s(20)), fill=WHITE)
-    draw.text((text_x, s(116)), f"LEVEL {level}!", font=_font(True, s(36)), fill=GOLD)
+    text_x = s(60)
+    name_font = _font(True, s(34))
+    levelup_font = _font(True, s(46))
+    draw.text((text_x, s(35)), name, font=name_font, fill=GOLD)
+    draw.text((text_x, s(82)), "LEVEL UP!", font=levelup_font, fill=WHITE)
+    levelup_bbox = draw.textbbox((0, 0), "LEVEL UP!", font=levelup_font)
+    levelup_w = levelup_bbox[2] - levelup_bbox[0]
 
-    ratio = (gg_into_level / gg_needed) if gg_needed else 1.0
-    bar_right = W - avatar_size - s(65)
-    bar_box = (text_x, s(190), bar_right, s(208))
-    _progress_bar(draw, bar_box, ratio, LEVELUP_BAR_BG)
+    # transition badge: "{old level} ▶ {new level}" — the triangle is drawn
+    # as a polygon rather than a text glyph since Arimo doesn't include ▶.
+    num_font = _font(True, s(26))
+    old_text, new_text = str(old_level), str(new_level)
+    gap = s(12)
+    arrow_w = s(16)
+    old_bbox = draw.textbbox((0, 0), old_text, font=num_font)
+    new_bbox = draw.textbbox((0, 0), new_text, font=num_font)
+    old_w = old_bbox[2] - old_bbox[0]
+    new_w = new_bbox[2] - new_bbox[0]
+    text_h = old_bbox[3] - old_bbox[1]
+    pad_x, pad_y = s(24), s(14)
+    badge_w = old_w + gap + arrow_w + gap + new_w + pad_x * 2
+    badge_h = text_h + pad_y * 2
 
-    gg_text = _gg_text(gg_into_level, gg_needed)
-    bbox = draw.textbbox((0, 0), gg_text, font=_font(False, s(16)))
-    draw.text((bar_right - (bbox[2] - bbox[0]), s(216)), gg_text, font=_font(False, s(16)), fill=WHITE)
+    badge_x = text_x + levelup_w + s(50)
+    badge_x = min(badge_x, avatar_x - badge_w - s(30))
+    badge_y = (H - badge_h) // 2
+    draw.rounded_rectangle(
+        (badge_x, badge_y, badge_x + badge_w, badge_y + badge_h),
+        radius=badge_h // 2, fill=BADGE_BG
+    )
+    cx, cy = badge_x + pad_x, badge_y + pad_y
+    draw.text((cx, cy), old_text, font=num_font, fill=BADGE_OLD)
+    cx += old_w + gap
+    tri_mid_y = badge_y + badge_h // 2
+    tri_half_h = s(9)
+    draw.polygon(
+        [(cx, tri_mid_y - tri_half_h), (cx, tri_mid_y + tri_half_h), (cx + arrow_w, tri_mid_y)],
+        fill=GOLD
+    )
+    cx += arrow_w + gap
+    draw.text((cx, cy), new_text, font=num_font, fill=GOLD)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")

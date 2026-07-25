@@ -32,7 +32,7 @@ async def _get_background(db, guild_id: int, member_row: dict) -> Optional[bytes
     return await _fetch_bytes(card["image_url"])
 
 
-async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, level: int, total_gg: int):
+async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, old_level: int, new_level: int):
     config = await db.get_guild_config(guild.id)
     channel_id = config.get("levelup_channel_id")
     if not channel_id:
@@ -40,18 +40,15 @@ async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, le
     channel = guild.get_channel(channel_id)
     if channel is None:
         return
-    _, gg_into_level, gg_needed = levels.get_progress(total_gg)
-    tier_name = levels.get_tier_name(level)
     member_row = await db.get_member(guild.id, member.id)
     background_bytes = await _get_background(db, guild.id, member_row)
     avatar_bytes = await member.display_avatar.read()
     buf = cards.render_levelup_card(
-        member.display_name, avatar_bytes, level, tier_name,
-        gg_into_level, gg_needed, background_bytes
+        member.display_name, avatar_bytes, old_level, new_level, background_bytes
     )
     try:
         await channel.send(
-            content=f"🎉 {member.mention} just reached **Level {level}**!",
+            content=f"🎉 {member.mention} just reached **Level {new_level}**!",
             file=discord.File(buf, filename="levelup.png")
         )
     except discord.HTTPException:
@@ -66,7 +63,7 @@ async def _award_gg(db, guild: discord.Guild, member: discord.Member, amount: in
     new_total = await db.add_gg(guild.id, member.id, amount)
     new_level = levels.get_level(new_total)
     if new_level > old_level:
-        await _announce_levelup(db, guild, member, new_level, new_total)
+        await _announce_levelup(db, guild, member, old_level, new_level)
 
 
 class UpdateGroup(app_commands.Group):
