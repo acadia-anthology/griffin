@@ -280,16 +280,15 @@ class PatronGroup(app_commands.Group):
             display_name, avatar_bytes, level, placement,
             stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color
         )
-        embed = discord.Embed(color=discord.Color.gold())
-        embed.set_image(url="attachment://rank.png")
-        embed.set_footer(text=TIP_FOOTER)
+        await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
+
         view = None
         if TIP_URL:
             view = discord.ui.View()
             view.add_item(discord.ui.Button(
                 label="🧌 Tip Your Favorite Goblin", style=discord.ButtonStyle.link, url=TIP_URL
             ))
-        await interaction.followup.send(embed=embed, file=discord.File(buf, filename="rank.png"), view=view)
+        await interaction.followup.send(content=f"-# {TIP_FOOTER}", view=view)
 
 
 class AddGroup(app_commands.Group):
