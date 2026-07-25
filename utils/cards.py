@@ -310,7 +310,10 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
     content_w = W - pad_x * 2
     avatar_size = s(150)
     avatar_top_padding = s(25)
-    banner_h = avatar_top_padding + avatar_size // 2  # avatar straddles the seam
+    # Wallpaper extends 75% down the avatar instead of just to its center,
+    # so only a small sliver of the bottom of the avatar sits in the solid
+    # body color — avatar position itself doesn't move, only the seam does.
+    banner_h = avatar_top_padding + int(avatar_size * 0.75)
     bar_h = s(44)
 
     name_font = _font(True, s(34))
@@ -370,7 +373,7 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
 
     avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(5), ring_color=accent)
     avatar_x = (W - avatar_size) // 2
-    avatar_y = banner_h - avatar_size // 2
+    avatar_y = avatar_top_padding
     img.paste(avatar, (avatar_x, avatar_y), avatar)
 
     cy = avatar_y + avatar_size + s(20)
@@ -405,26 +408,31 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
         draw.text(((W - bday_w) // 2, cy), bday_text, font=meta_font, fill=MUTED)
         cy += meta_line_h
 
+    def _centered(y, text, font, fill):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w = bbox[2] - bbox[0]
+        draw.text(((W - w) // 2, y), text, font=font, fill=fill)
+
     cy += s(28)
-    draw.text((pad_x, cy), "PATRON SUMMARY", font=section_font, fill=accent)
+    _centered(cy, "PATRON SUMMARY", section_font, accent)
     cy += section_h + s(10)
     for line in bio_lines:
-        draw.text((pad_x, cy), line, font=body_font, fill=bio_color)
+        _centered(cy, line, body_font, bio_color)
         cy += line_h
 
     if favorite_genres:
         cy += s(28)
-        draw.text((pad_x, cy), "FAVORITE GENRES", font=section_font, fill=accent)
+        _centered(cy, "FAVORITE GENRES", section_font, accent)
         cy += section_h + s(10)
         for line in genres_lines:
-            draw.text((pad_x, cy), line, font=body_font, fill=WHITE)
+            _centered(cy, line, body_font, WHITE)
             cy += line_h
 
     cy += s(28)
-    draw.text((pad_x, cy), "BOOKS CHECKED OUT", font=section_font, fill=accent)
+    _centered(cy, "BOOKS CHECKED OUT", section_font, accent)
     cy += section_h + s(10)
     for line in books_lines:
-        draw.text((pad_x, cy), line, font=body_font, fill=books_color)
+        _centered(cy, line, body_font, books_color)
         cy += line_h
 
     buf = io.BytesIO()
