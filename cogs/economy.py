@@ -111,7 +111,7 @@ class ProfileModal(discord.ui.Modal, title="Update Your Library Card"):
             interaction.guild.id, interaction.user.id,
             str(self.summary.value), str(self.genres.value), str(self.books.value)
         )
-        await interaction.response.send_message("✅ Library card updated.", ephemeral=True)
+        await interaction.response.send_message("✅ Library card updated.")
 
 
 class LibraryCardPicker(discord.ui.View):
@@ -193,7 +193,7 @@ class UpdateGroup(app_commands.Group):
             await interaction.response.send_message("No library cards have been added yet.", ephemeral=True)
             return
         view = LibraryCardPicker(self.db, interaction.guild.id, interaction.user.id, available)
-        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        await interaction.response.send_message(embed=view.embed(), view=view)
         view.message = await interaction.original_response()
 
 
