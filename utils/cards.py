@@ -139,7 +139,7 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
     img.paste(base, (0, 0), mask)
     draw = ImageDraw.Draw(img)
 
-    avatar_size = s(150)
+    avatar_size = s(120)
     avatar_x = W - avatar_size - s(45)
     avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4))
     img.paste(avatar, (avatar_x, (H - avatar_size) // 2), avatar)
@@ -157,13 +157,14 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
     num_font = _font(True, s(26))
     old_text, new_text = str(old_level), str(new_level)
     gap = s(12)
-    arrow_w = s(16)
+    arrow_w = s(9)
     old_bbox = draw.textbbox((0, 0), old_text, font=num_font)
     new_bbox = draw.textbbox((0, 0), new_text, font=num_font)
     old_w = old_bbox[2] - old_bbox[0]
     new_w = new_bbox[2] - new_bbox[0]
-    text_h = old_bbox[3] - old_bbox[1]
-    pad_x, pad_y = s(24), s(14)
+    text_top, text_bottom = old_bbox[1], old_bbox[3]
+    text_h = text_bottom - text_top
+    pad_x, pad_y = s(24), s(6)
     badge_w = old_w + gap + arrow_w + gap + new_w + pad_x * 2
     badge_h = text_h + pad_y * 2
 
@@ -174,15 +175,23 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
         (badge_x, badge_y, badge_x + badge_w, badge_y + badge_h),
         radius=badge_h // 2, fill=BADGE_BG
     )
-    cx, cy = badge_x + pad_x, badge_y + pad_y
+    # cy is where the glyph's own top (text_top, usually negative for cap
+    # height) needs to land so the visible text sits pad_y below the badge —
+    # subtracting it keeps "0"/"9" vertically matched between old and new.
+    cx = badge_x + pad_x
+    cy = badge_y + pad_y - text_top
     draw.text((cx, cy), old_text, font=num_font, fill=BADGE_OLD)
     cx += old_w + gap
-    tri_mid_y = badge_y + badge_h // 2
-    tri_half_h = s(9)
-    draw.polygon(
-        [(cx, tri_mid_y - tri_half_h), (cx, tri_mid_y + tri_half_h), (cx + arrow_w, tri_mid_y)],
-        fill=GOLD
-    )
+
+    # Triangle: smaller than the number glyphs, centered both on the text's
+    # vertical middle and in the horizontal gap between the two numbers.
+    # Corners softened with tiny circles rather than a sharp polygon point.
+    tri_mid_y = badge_y + pad_y + text_h // 2
+    tri_half_h = s(6)
+    tri_pts = [(cx, tri_mid_y - tri_half_h), (cx, tri_mid_y + tri_half_h), (cx + arrow_w, tri_mid_y)]
+    draw.polygon(tri_pts, fill=GOLD)
+    for px, py in tri_pts:
+        draw.ellipse((px - s(1), py - s(1), px + s(1), py + s(1)), fill=GOLD)
     cx += arrow_w + gap
     draw.text((cx, cy), new_text, font=num_font, fill=GOLD)
 
