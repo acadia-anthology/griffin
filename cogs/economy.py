@@ -15,8 +15,8 @@ VOICE_TICK_MINUTES = 5
 # exists, at which point the button just starts appearing automatically.
 TIP_URL = None
 TIP_FOOTER = (
-    "Goblins are notoriously underpaid — tipping keeps them from staging "
-    "a coup against librarians... again..."
+    "Griffin is notoriously underpaid — tipping them staves off the urge "
+    "to stage a coup against librarians... again..."
 )
 
 
