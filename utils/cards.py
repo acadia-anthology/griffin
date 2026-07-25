@@ -329,15 +329,17 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
     meta_line_h = (meta_bbox[3] - meta_bbox[1]) + s(6)
     section_h = section_bbox[3] - section_bbox[1]
 
-    bio_text = bio or "Let them type something about themself..."
+    bio_text = bio or "Patron has yet to tell us about themself..."
     bio_color = WHITE if bio else PLACEHOLDER
     bio_lines = _wrap_text(measure, bio_text, body_font, content_w)
 
-    genres_text = favorite_genres or "Let them type their favorite genres..."
-    genres_color = WHITE if favorite_genres else PLACEHOLDER
-    genres_lines = _wrap_text(measure, genres_text, body_font, content_w)
+    # Favorite Genres is the one section that's omitted entirely when empty,
+    # rather than showing placeholder copy like the other two.
+    genres_lines = _wrap_text(measure, favorite_genres, body_font, content_w) if favorite_genres else []
 
-    books_text = books_checked_out or "Let them list what they've got checked out..."
+    books_text = books_checked_out or (
+        "Patron should check out a book soon, or their library card may suspiciously be suspended..."
+    )
     books_color = WHITE if books_checked_out else PLACEHOLDER
     books_lines = _wrap_text(measure, books_text, body_font, content_w)
 
@@ -352,8 +354,9 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
         y += meta_line_h
     y += s(28)
     y += section_h + s(10) + line_h * len(bio_lines)
-    y += s(28)
-    y += section_h + s(10) + line_h * len(genres_lines)
+    if favorite_genres:
+        y += s(28)
+        y += section_h + s(10) + line_h * len(genres_lines)
     y += s(28)
     y += section_h + s(10) + line_h * len(books_lines)
     y += s(30)
@@ -409,12 +412,13 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
         draw.text((pad_x, cy), line, font=body_font, fill=bio_color)
         cy += line_h
 
-    cy += s(28)
-    draw.text((pad_x, cy), "FAVORITE GENRES", font=section_font, fill=accent)
-    cy += section_h + s(10)
-    for line in genres_lines:
-        draw.text((pad_x, cy), line, font=body_font, fill=genres_color)
-        cy += line_h
+    if favorite_genres:
+        cy += s(28)
+        draw.text((pad_x, cy), "FAVORITE GENRES", font=section_font, fill=accent)
+        cy += section_h + s(10)
+        for line in genres_lines:
+            draw.text((pad_x, cy), line, font=body_font, fill=WHITE)
+            cy += line_h
 
     cy += s(28)
     draw.text((pad_x, cy), "BOOKS CHECKED OUT", font=section_font, fill=accent)
