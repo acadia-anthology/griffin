@@ -142,8 +142,16 @@ def _progress_bar(draw: ImageDraw.ImageDraw, box, ratio: float, bar_bg, fill_col
     draw.rounded_rectangle(box, radius=radius, fill=bar_bg)
     ratio = max(0.0, min(1.0, ratio))
     if ratio > 0:
-        fill_x1 = max(x0 + int((x1 - x0) * ratio), x0 + (y1 - y0))
-        draw.rounded_rectangle((x0, y0, min(fill_x1, x1), y1), radius=radius, fill=fill_color)
+        # Fill sits inset inside the track on all sides (not flush with the
+        # top/bottom/left edges) so the gray track reads as a visible margin
+        # around it, not just leftover space on the right.
+        pad = max(2, (y1 - y0) // 5)
+        fx0, fy0, fy1 = x0 + pad, y0 + pad, y1 - pad
+        f_radius = (fy1 - fy0) // 2
+        fill_w = (x1 - x0 - pad * 2) * ratio
+        fx1 = max(fx0 + int(fill_w), fx0 + f_radius * 2)
+        fx1 = min(fx1, x1 - pad)
+        draw.rounded_rectangle((fx0, fy0, fx1, fy1), radius=f_radius, fill=fill_color)
 
 
 def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) -> Image.Image:
