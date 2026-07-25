@@ -19,11 +19,9 @@ BAR_FILL = GOLD
 # attachment previews to a shared width, so the *pixel* dimensions (not just
 # relative proportions) need a real gap or they read as the same size in-chat.
 RANK_BG = (35, 35, 34)
-RANK_BORDER = (65, 65, 62)
 RANK_BAR_BG = (75, 75, 72)
 
 LEVELUP_BG = (74, 73, 69)
-LEVELUP_BORDER = (100, 99, 94)
 LEVELUP_BAR_BG = (110, 109, 104)
 
 # Every render function below is laid out in "logical" pixels, then scaled up
@@ -71,7 +69,7 @@ def _progress_bar(draw: ImageDraw.ImageDraw, box, ratio: float, bar_bg):
         draw.rounded_rectangle((x0, y0, min(fill_x1, x1), y1), radius=radius, fill=BAR_FILL)
 
 
-def _base_canvas(w: int, h: int, bg_color, border_color, background_bytes: Optional[bytes]) -> Image.Image:
+def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) -> Image.Image:
     img = Image.new("RGB", (w, h), bg_color)
     if background_bytes:
         try:
@@ -85,8 +83,6 @@ def _base_canvas(w: int, h: int, bg_color, border_color, background_bytes: Optio
             img = Image.blend(bg, overlay, 0.35)  # darken so text stays legible over art
         except Exception:
             pass
-    draw = ImageDraw.Draw(img)
-    draw.rectangle((0, 0, w - 1, h - 1), outline=border_color, width=s(2))
     return img
 
 
@@ -100,7 +96,7 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
                       gg_into_level: int, gg_needed: int,
                       background_bytes: Optional[bytes] = None) -> io.BytesIO:
     W, H = s(480), s(130)
-    img = _base_canvas(W, H, RANK_BG, RANK_BORDER, background_bytes)
+    img = _base_canvas(W, H, RANK_BG, background_bytes)
     draw = ImageDraw.Draw(img)
 
     avatar_size = s(85)
@@ -133,7 +129,7 @@ def render_levelup_card(name: str, avatar_bytes: bytes, level: int, tier_name: s
                          gg_into_level: int, gg_needed: int,
                          background_bytes: Optional[bytes] = None) -> io.BytesIO:
     W, H = s(780), s(300)
-    img = _base_canvas(W, H, LEVELUP_BG, LEVELUP_BORDER, background_bytes)
+    img = _base_canvas(W, H, LEVELUP_BG, background_bytes)
     draw = ImageDraw.Draw(img)
 
     avatar_size = s(200)
