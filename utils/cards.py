@@ -152,7 +152,7 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
                          background_bytes: Optional[bytes] = None,
                          accent_color: Optional[tuple] = None) -> io.BytesIO:
     accent = accent_color or GOLD
-    W, H = s(780), s(220)
+    W, H = s(780), s(122)
     pill_radius = H // 2
 
     # Same background/accent treatment as the rank card — the two are meant
@@ -183,7 +183,7 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
 
     # Name + "LEVEL UP!" form one block, vertically centered against the
     # card (and therefore the avatar) instead of pinned near the top.
-    line_gap = s(6)
+    line_gap = s(14)
     block_h = name_h + line_gap + levelup_h
     block_top = (H - block_h) // 2
     name_y = block_top - name_bbox[1]
