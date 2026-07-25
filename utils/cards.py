@@ -26,6 +26,17 @@ LEVELUP_BG = (74, 73, 69)
 LEVELUP_BORDER = (100, 99, 94)
 LEVELUP_BAR_BG = (110, 109, 104)
 
+# Every render function below is laid out in "logical" pixels, then scaled up
+# before drawing. Discord doesn't upscale small attachments to fill the chat
+# width, so a card sized for its logical dimensions looks soft on high-DPI
+# screens — rendering at 2x and letting the client downscale keeps text and
+# edges crisp. Bump SCALE (not the per-card numbers) to go sharper later.
+SCALE = 2
+
+
+def s(value: int) -> int:
+    return round(value * SCALE)
+
 
 def _font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
     try:
@@ -75,7 +86,7 @@ def _base_canvas(w: int, h: int, bg_color, border_color, background_bytes: Optio
         except Exception:
             pass
     draw = ImageDraw.Draw(img)
-    draw.rectangle((0, 0, w - 1, h - 1), outline=border_color, width=2)
+    draw.rectangle((0, 0, w - 1, h - 1), outline=border_color, width=s(2))
     return img
 
 
@@ -88,29 +99,29 @@ def _gg_text(gg_into_level: int, gg_needed: int) -> str:
 def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[int],
                       gg_into_level: int, gg_needed: int,
                       background_bytes: Optional[bytes] = None) -> io.BytesIO:
-    W, H = 480, 130
+    W, H = s(480), s(130)
     img = _base_canvas(W, H, RANK_BG, RANK_BORDER, background_bytes)
     draw = ImageDraw.Draw(img)
 
-    avatar_size = 85
-    avatar = _circular_avatar(avatar_bytes, avatar_size)
-    img.paste(avatar, (W - avatar_size - 18, (H - avatar_size) // 2), avatar)
+    avatar_size = s(85)
+    avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4))
+    img.paste(avatar, (W - avatar_size - s(18), (H - avatar_size) // 2), avatar)
 
-    text_x = 18
-    draw.text((text_x, 12), name, font=_font(True, 20), fill=GOLD)
-    draw.text((text_x, 38), f"LEVEL: {level}", font=_font(True, 15), fill=WHITE)
+    text_x = s(18)
+    draw.text((text_x, s(12)), name, font=_font(True, s(20)), fill=GOLD)
+    draw.text((text_x, s(38)), f"LEVEL: {level}", font=_font(True, s(15)), fill=WHITE)
 
     ratio = (gg_into_level / gg_needed) if gg_needed else 1.0
-    bar_right = W - avatar_size - 36
-    bar_box = (text_x, 66, bar_right, 76)
+    bar_right = W - avatar_size - s(36)
+    bar_box = (text_x, s(66), bar_right, s(76))
     _progress_bar(draw, bar_box, ratio, RANK_BAR_BG)
 
     rank_text = f"RANK: {rank}" if rank else "RANK: Unranked"
-    draw.text((text_x, 84), rank_text, font=_font(False, 12), fill=WHITE)
+    draw.text((text_x, s(84)), rank_text, font=_font(False, s(12)), fill=WHITE)
 
     gg_text = _gg_text(gg_into_level, gg_needed)
-    bbox = draw.textbbox((0, 0), gg_text, font=_font(False, 12))
-    draw.text((bar_right - (bbox[2] - bbox[0]), 84), gg_text, font=_font(False, 12), fill=WHITE)
+    bbox = draw.textbbox((0, 0), gg_text, font=_font(False, s(12)))
+    draw.text((bar_right - (bbox[2] - bbox[0]), s(84)), gg_text, font=_font(False, s(12)), fill=WHITE)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -121,27 +132,27 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
 def render_levelup_card(name: str, avatar_bytes: bytes, level: int, tier_name: str,
                          gg_into_level: int, gg_needed: int,
                          background_bytes: Optional[bytes] = None) -> io.BytesIO:
-    W, H = 780, 300
+    W, H = s(780), s(300)
     img = _base_canvas(W, H, LEVELUP_BG, LEVELUP_BORDER, background_bytes)
     draw = ImageDraw.Draw(img)
 
-    avatar_size = 200
-    avatar = _circular_avatar(avatar_bytes, avatar_size)
-    img.paste(avatar, (W - avatar_size - 35, (H - avatar_size) // 2), avatar)
+    avatar_size = s(200)
+    avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(4))
+    img.paste(avatar, (W - avatar_size - s(35), (H - avatar_size) // 2), avatar)
 
-    text_x = 35
-    draw.text((text_x, 30), name, font=_font(True, 42), fill=GOLD)
-    draw.text((text_x, 82), tier_name, font=_font(False, 20), fill=WHITE)
-    draw.text((text_x, 116), f"LEVEL {level}!", font=_font(True, 36), fill=GOLD)
+    text_x = s(35)
+    draw.text((text_x, s(30)), name, font=_font(True, s(42)), fill=GOLD)
+    draw.text((text_x, s(82)), tier_name, font=_font(False, s(20)), fill=WHITE)
+    draw.text((text_x, s(116)), f"LEVEL {level}!", font=_font(True, s(36)), fill=GOLD)
 
     ratio = (gg_into_level / gg_needed) if gg_needed else 1.0
-    bar_right = W - avatar_size - 65
-    bar_box = (text_x, 190, bar_right, 208)
+    bar_right = W - avatar_size - s(65)
+    bar_box = (text_x, s(190), bar_right, s(208))
     _progress_bar(draw, bar_box, ratio, LEVELUP_BAR_BG)
 
     gg_text = _gg_text(gg_into_level, gg_needed)
-    bbox = draw.textbbox((0, 0), gg_text, font=_font(False, 16))
-    draw.text((bar_right - (bbox[2] - bbox[0]), 216), gg_text, font=_font(False, 16), fill=WHITE)
+    bbox = draw.textbbox((0, 0), gg_text, font=_font(False, s(16)))
+    draw.text((bar_right - (bbox[2] - bbox[0]), s(216)), gg_text, font=_font(False, s(16)), fill=WHITE)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
