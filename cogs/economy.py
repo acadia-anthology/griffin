@@ -135,7 +135,7 @@ class PatronGroup(app_commands.Group):
         background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
         buf = cards.render_rank_card(
             target.display_name, avatar_bytes, level, placement,
-            gg_into_level, gg_needed, background_bytes, accent_color
+            stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color
         )
         await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
 

@@ -107,14 +107,18 @@ def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) ->
     return img
 
 
-def _gg_text(gg_into_level: int, gg_needed: int) -> str:
+def _gg_text(total_gg: int, gg_into_level: int, gg_needed: int) -> str:
+    # Headline number is the member's actual total GG, not progress-since-
+    # last-threshold — showing gg_into_level alone reads as "0 GG" right
+    # after leveling up, which is misleading even though it's correct math.
     if gg_needed:
-        return f"{gg_into_level:,} / {gg_needed:,} GG"
-    return f"{gg_into_level:,} GG (MAX)"
+        next_threshold = total_gg - gg_into_level + gg_needed
+        return f"{total_gg:,} / {next_threshold:,} GG"
+    return f"{total_gg:,} GG (MAX)"
 
 
 def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[int],
-                      gg_into_level: int, gg_needed: int,
+                      total_gg: int, gg_into_level: int, gg_needed: int,
                       background_bytes: Optional[bytes] = None,
                       accent_color: Optional[tuple] = None) -> io.BytesIO:
     accent = accent_color or GOLD
@@ -138,7 +142,7 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
     rank_text = f"RANK: {rank}" if rank else "RANK: Unranked"
     draw.text((text_x, s(84)), rank_text, font=_font(False, s(12)), fill=WHITE)
 
-    gg_text = _gg_text(gg_into_level, gg_needed)
+    gg_text = _gg_text(total_gg, gg_into_level, gg_needed)
     bbox = draw.textbbox((0, 0), gg_text, font=_font(False, s(12)))
     draw.text((bar_right - (bbox[2] - bbox[0]), s(84)), gg_text, font=_font(False, s(12)), fill=WHITE)
 
