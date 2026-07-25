@@ -51,7 +51,7 @@ async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, le
     )
     try:
         await channel.send(
-            content=f"🎉 {member.mention} just reached **Goblin Grade {level}**!",
+            content=f"🎉 {member.mention} just reached **Level {level}**!",
             file=discord.File(buf, filename="levelup.png")
         )
     except discord.HTTPException:
