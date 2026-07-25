@@ -74,10 +74,46 @@ async def _award_gg(db, guild: discord.Guild, member: discord.Member, amount: in
         await _announce_levelup(db, guild, member, old_level, new_level)
 
 
+class ProfileModal(discord.ui.Modal, title="Update Your Library Card"):
+    def __init__(self, db, current_bio: str, current_genres: str):
+        super().__init__()
+        self.db = db
+        self.summary = discord.ui.TextInput(
+            label="Patron Summary",
+            style=discord.TextStyle.paragraph,
+            placeholder="Let them type something about themself...",
+            default=current_bio,
+            max_length=300,
+            required=False,
+        )
+        self.genres = discord.ui.TextInput(
+            label="Favorite Genres",
+            style=discord.TextStyle.short,
+            placeholder="Let them type their favorite genres...",
+            default=current_genres,
+            max_length=150,
+            required=False,
+        )
+        self.add_item(self.summary)
+        self.add_item(self.genres)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.db.set_profile_text(
+            interaction.guild.id, interaction.user.id, str(self.summary.value), str(self.genres.value)
+        )
+        await interaction.response.send_message("✅ Library card updated.", ephemeral=True)
+
+
 class UpdateGroup(app_commands.Group):
     def __init__(self, db):
         super().__init__(name="update", description="Update your own profile")
         self.db = db
+
+    @app_commands.command(name="profile", description="Edit your library card bio and favorite genres.")
+    async def profile(self, interaction: discord.Interaction):
+        stats = await self.db.get_member(interaction.guild.id, interaction.user.id)
+        modal = ProfileModal(self.db, stats.get("bio") or "", stats.get("favorite_genres") or "")
+        await interaction.response.send_modal(modal)
 
     async def card_autocomplete(self, interaction: discord.Interaction, current: str):
         available = await self.db.get_library_cards(interaction.guild.id)
@@ -145,20 +181,21 @@ class PatronGroup(app_commands.Group):
     @app_commands.describe(member="Whose card to view (defaults to you)")
     async def library_card(self, interaction: discord.Interaction, member: discord.Member = None):
         target = member or interaction.user
+        await interaction.response.defer()
         stats = await self.db.get_member(interaction.guild.id, target.id)
-        embed = discord.Embed(
-            title=f"{target.display_name}'s Library Card",
-            description="🚧 Placeholder card — full design coming soon.",
-            color=discord.Color.gold()
+        placement = await self.db.get_rank(interaction.guild.id, target.id)
+        level = levels.get_level(stats["gg"])
+        display_name = cards.sanitize_name(target.display_name, target.name)
+        avatar_bytes = await target.display_avatar.read()
+        background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
+        member_since = target.joined_at.strftime("%B %d, %Y") if target.joined_at else "Unknown"
+        buf = cards.render_library_card(
+            display_name, avatar_bytes, level, placement, stats["gg"], member_since,
+            stats.get("bio"), stats.get("favorite_genres"),
+            birthday=None,  # not implemented yet — always hidden until that feature lands
+            background_bytes=background_bytes, accent_color=accent_color
         )
-        embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(name="Goblin Gold", value=str(stats["gg"]))
-        if stats["card_id"]:
-            card = await self.db.get_card(stats["card_id"])
-            if card:
-                embed.set_image(url=card["image_url"])
-                embed.add_field(name="Card", value=card["name"])
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(file=discord.File(buf, filename="library-card.png"))
 
 
 class AddGroup(app_commands.Group):

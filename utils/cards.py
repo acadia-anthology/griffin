@@ -23,6 +23,8 @@ RANK_BG = (35, 35, 34)
 RANK_BAR_BG = (75, 75, 72)
 BADGE_BG = (20, 20, 19)
 BADGE_OLD = (150, 150, 148)
+MUTED = (170, 170, 168)
+PLACEHOLDER = (140, 140, 138)
 
 # Every render function below is laid out in "logical" pixels, then scaled up
 # before drawing. Discord doesn't upscale small attachments to fill the chat
@@ -266,6 +268,146 @@ def render_levelup_card(name: str, avatar_bytes: bytes, old_level: int, new_leve
     img.paste(triangle, (cx, tri_mid_y - tri_h // 2), triangle)
     cx += arrow_w + gap
     draw.text((cx, cy), new_text, font=num_font, fill=accent)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list:
+    if not text:
+        return []
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        trial = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[int],
+                         total_gg: int, member_since: str,
+                         bio: Optional[str], favorite_genres: Optional[str],
+                         birthday: Optional[str] = None,
+                         background_bytes: Optional[bytes] = None,
+                         accent_color: Optional[tuple] = None) -> io.BytesIO:
+    """Taller than the rank/level-up cards and variable height — the bottom
+    grows to fit the bio/genres text, so layout is computed twice: once on a
+    throwaway canvas to measure total height, then for real once H is known."""
+    accent = accent_color or GOLD
+    W = s(700)
+    pad_x = s(40)
+    content_w = W - pad_x * 2
+    avatar_size = s(150)
+    avatar_top_padding = s(25)
+    banner_h = avatar_top_padding + avatar_size // 2  # avatar straddles the seam
+    bar_h = s(44)
+
+    name_font = _font(True, s(34))
+    label_font = _font(True, s(18))
+    bar_font = _font(True, s(18))
+    meta_font = _font(False, s(15))
+    section_font = _font(True, s(20))
+    body_font = _font(False, s(17))
+    line_h = s(24)
+
+    measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    name_bbox = measure.textbbox((0, 0), name, font=name_font)
+    label_bbox = measure.textbbox((0, 0), "LIBRARY CARD", font=label_font)
+    meta_bbox = measure.textbbox((0, 0), "Ag", font=meta_font)
+    section_bbox = measure.textbbox((0, 0), "PATRON SUMMARY", font=section_font)
+    meta_line_h = (meta_bbox[3] - meta_bbox[1]) + s(6)
+    section_h = section_bbox[3] - section_bbox[1]
+
+    bio_text = bio or "Let them type something about themself..."
+    bio_color = WHITE if bio else PLACEHOLDER
+    bio_lines = _wrap_text(measure, bio_text, body_font, content_w)
+
+    genres_text = favorite_genres or "Let them type their favorite genres..."
+    genres_color = WHITE if favorite_genres else PLACEHOLDER
+    genres_lines = _wrap_text(measure, genres_text, body_font, content_w)
+
+    # --- accumulate total height ---
+    y = banner_h + avatar_size // 2  # avatar straddles the banner/body seam
+    y += s(20)
+    y += (name_bbox[3] - name_bbox[1]) + s(8)
+    y += (label_bbox[3] - label_bbox[1]) + s(16)
+    y += bar_h + s(16)
+    y += meta_line_h
+    if birthday:
+        y += meta_line_h
+    y += s(28)
+    y += section_h + s(10) + line_h * len(bio_lines)
+    y += s(28)
+    y += section_h + s(10) + line_h * len(genres_lines)
+    y += s(30)
+    H = y
+
+    # --- draw for real ---
+    banner = _base_canvas(W, banner_h, RANK_BG, background_bytes)
+    img = Image.new("RGB", (W, H), RANK_BG)
+    img.paste(banner, (0, 0))
+    draw = ImageDraw.Draw(img)
+
+    avatar = _circular_avatar(avatar_bytes, avatar_size, ring_width=s(5), ring_color=accent)
+    avatar_x = (W - avatar_size) // 2
+    avatar_y = banner_h - avatar_size // 2
+    img.paste(avatar, (avatar_x, avatar_y), avatar)
+
+    cy = avatar_y + avatar_size + s(20)
+    name_w = name_bbox[2] - name_bbox[0]
+    draw.text(((W - name_w) // 2, cy - name_bbox[1]), name, font=name_font, fill=accent)
+    cy += (name_bbox[3] - name_bbox[1]) + s(8)
+
+    label_w = label_bbox[2] - label_bbox[0]
+    draw.text(((W - label_w) // 2, cy - label_bbox[1]), "LIBRARY CARD", font=label_font, fill=WHITE)
+    cy += (label_bbox[3] - label_bbox[1]) + s(16)
+
+    bar_box = (pad_x, cy, W - pad_x, cy + bar_h)
+    draw.rounded_rectangle(bar_box, radius=bar_h // 2, fill=accent)
+    rank_text = str(rank) if rank else "Unranked"
+    stat_text = f"LEVEL: {level}   |   RANK: {rank_text}   |   GG: {total_gg:,}"
+    stat_bbox = draw.textbbox((0, 0), stat_text, font=bar_font)
+    stat_w = stat_bbox[2] - stat_bbox[0]
+    stat_h = stat_bbox[3] - stat_bbox[1]
+    draw.text(
+        ((W - stat_w) // 2, cy + bar_h // 2 - stat_h // 2 - stat_bbox[1]),
+        stat_text, font=bar_font, fill=RANK_BG
+    )
+    cy += bar_h + s(16)
+
+    since_text = f"MEMBER SINCE: {member_since}"
+    since_w = draw.textbbox((0, 0), since_text, font=meta_font)[2]
+    draw.text(((W - since_w) // 2, cy), since_text, font=meta_font, fill=MUTED)
+    cy += meta_line_h
+    if birthday:
+        bday_text = f"BIRTHDAY: {birthday}"
+        bday_w = draw.textbbox((0, 0), bday_text, font=meta_font)[2]
+        draw.text(((W - bday_w) // 2, cy), bday_text, font=meta_font, fill=MUTED)
+        cy += meta_line_h
+
+    cy += s(28)
+    draw.text((pad_x, cy), "PATRON SUMMARY", font=section_font, fill=accent)
+    cy += section_h + s(10)
+    for line in bio_lines:
+        draw.text((pad_x, cy), line, font=body_font, fill=bio_color)
+        cy += line_h
+
+    cy += s(28)
+    draw.text((pad_x, cy), "FAVORITE GENRES", font=section_font, fill=accent)
+    cy += section_h + s(10)
+    for line in genres_lines:
+        draw.text((pad_x, cy), line, font=body_font, fill=genres_color)
+        cy += line_h
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
