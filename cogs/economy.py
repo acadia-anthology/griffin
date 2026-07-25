@@ -171,7 +171,7 @@ class LibraryCardPicker(discord.ui.View):
         self.index = (self.index + 1) % len(self.available)
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="✏️ Edit Details", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="📝 Edit Card Details", style=discord.ButtonStyle.primary)
     async def edit_details(self, interaction: discord.Interaction, button: discord.ui.Button):
         stats = await self.db.get_member(self.guild_id, self.user_id)
         modal = ProfileModal(
