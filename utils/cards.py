@@ -11,6 +11,26 @@ from PIL import Image, ImageDraw, ImageFont
 _HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_PATH = os.path.join(_HERE, "..", "assets", "fonts", "Arimo.ttf")
 
+# Hardcoded bot-wide fallback background — used on every card whenever a
+# member hasn't equipped their own library card. Drop an image in at this
+# path (assets/default_background.png) to enable it; until then this is a
+# no-op and cards just show their flat solid color, same as before.
+DEFAULT_BACKGROUND_PATH = os.path.join(_HERE, "..", "assets", "default_background.png")
+_default_background_cache = None
+_default_background_loaded = False
+
+
+def _load_default_background() -> Optional[bytes]:
+    global _default_background_cache, _default_background_loaded
+    if not _default_background_loaded:
+        try:
+            with open(DEFAULT_BACKGROUND_PATH, "rb") as f:
+                _default_background_cache = f.read()
+        except OSError:
+            _default_background_cache = None
+        _default_background_loaded = True
+    return _default_background_cache
+
 GOLD = (201, 173, 106)
 WHITE = (225, 225, 225)
 BAR_FILL = GOLD
@@ -123,6 +143,7 @@ def _progress_bar(draw: ImageDraw.ImageDraw, box, ratio: float, bar_bg, fill_col
 
 
 def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) -> Image.Image:
+    background_bytes = background_bytes or _load_default_background()
     img = Image.new("RGB", (w, h), bg_color)
     if background_bytes:
         try:
