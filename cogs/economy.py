@@ -75,7 +75,7 @@ async def _award_gg(db, guild: discord.Guild, member: discord.Member, amount: in
 
 
 class ProfileModal(discord.ui.Modal, title="Update Your Library Card"):
-    def __init__(self, db, current_bio: str, current_genres: str):
+    def __init__(self, db, current_bio: str, current_genres: str, current_books: str):
         super().__init__()
         self.db = db
         self.summary = discord.ui.TextInput(
@@ -94,14 +94,82 @@ class ProfileModal(discord.ui.Modal, title="Update Your Library Card"):
             max_length=150,
             required=False,
         )
+        self.books = discord.ui.TextInput(
+            label="Books Checked Out",
+            style=discord.TextStyle.short,
+            placeholder="Let them list what they've got checked out...",
+            default=current_books,
+            max_length=150,
+            required=False,
+        )
         self.add_item(self.summary)
         self.add_item(self.genres)
+        self.add_item(self.books)
 
     async def on_submit(self, interaction: discord.Interaction):
         await self.db.set_profile_text(
-            interaction.guild.id, interaction.user.id, str(self.summary.value), str(self.genres.value)
+            interaction.guild.id, interaction.user.id,
+            str(self.summary.value), str(self.genres.value), str(self.books.value)
         )
         await interaction.response.send_message("✅ Library card updated.", ephemeral=True)
+
+
+class LibraryCardPicker(discord.ui.View):
+    def __init__(self, db, guild_id: int, user_id: int, available: list):
+        super().__init__(timeout=120)
+        self.db = db
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.available = available
+        self.index = 0
+        self.message: discord.Message = None
+
+    def embed(self) -> discord.Embed:
+        card = self.available[self.index]
+        embed = discord.Embed(
+            title=card["name"],
+            description=f"Card {self.index + 1} of {len(self.available)}",
+            color=discord.Color.gold()
+        )
+        embed.set_image(url=card["image_url"])
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your library card picker.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index = (self.index - 1) % len(self.available)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="✅ Select", style=discord.ButtonStyle.success)
+    async def select(self, interaction: discord.Interaction, button: discord.ui.Button):
+        card = self.available[self.index]
+        await self.db.set_member_card(self.guild_id, self.user_id, card["id"])
+        for child in self.children:
+            child.disabled = True
+        embed = self.embed()
+        embed.color = discord.Color.green()
+        embed.set_footer(text=f"✅ Library card set to {card['name']}")
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index = (self.index + 1) % len(self.available)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
 
 
 class UpdateGroup(app_commands.Group):
@@ -109,31 +177,24 @@ class UpdateGroup(app_commands.Group):
         super().__init__(name="update", description="Update your own profile")
         self.db = db
 
-    @app_commands.command(name="profile", description="Edit your library card bio and favorite genres.")
+    @app_commands.command(name="profile", description="Edit your library card bio, genres, and checked-out books.")
     async def profile(self, interaction: discord.Interaction):
         stats = await self.db.get_member(interaction.guild.id, interaction.user.id)
-        modal = ProfileModal(self.db, stats.get("bio") or "", stats.get("favorite_genres") or "")
+        modal = ProfileModal(
+            self.db, stats.get("bio") or "", stats.get("favorite_genres") or "",
+            stats.get("books_checked_out") or ""
+        )
         await interaction.response.send_modal(modal)
 
-    async def card_autocomplete(self, interaction: discord.Interaction, current: str):
+    @app_commands.command(name="library-card", description="Browse and choose your library card design.")
+    async def library_card(self, interaction: discord.Interaction):
         available = await self.db.get_library_cards(interaction.guild.id)
-        current = current.lower()
-        matches = [c for c in available if current in c["name"].lower()]
-        return [
-            app_commands.Choice(name=c["name"], value=str(c["id"]))
-            for c in matches[:25]
-        ]
-
-    @app_commands.command(name="library-card", description="Choose your library card design.")
-    @app_commands.describe(card="Which card to use")
-    @app_commands.autocomplete(card=card_autocomplete)
-    async def library_card(self, interaction: discord.Interaction, card: str):
-        card_row = await self.db.get_card(int(card))
-        if card_row is None:
-            await interaction.response.send_message("❌ That card doesn't exist anymore. Pick another.", ephemeral=True)
+        if not available:
+            await interaction.response.send_message("No library cards have been added yet.", ephemeral=True)
             return
-        await self.db.set_member_card(interaction.guild.id, interaction.user.id, card_row["id"])
-        await interaction.response.send_message(f"✅ Library card set to **{card_row['name']}**.")
+        view = LibraryCardPicker(self.db, interaction.guild.id, interaction.user.id, available)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
 
 class PatronGroup(app_commands.Group):
@@ -191,7 +252,7 @@ class PatronGroup(app_commands.Group):
         member_since = target.joined_at.strftime("%B %d, %Y") if target.joined_at else "Unknown"
         buf = cards.render_library_card(
             display_name, avatar_bytes, level, placement, stats["gg"], member_since,
-            stats.get("bio"), stats.get("favorite_genres"),
+            stats.get("bio"), stats.get("favorite_genres"), stats.get("books_checked_out"),
             birthday=None,  # not implemented yet — always hidden until that feature lands
             background_bytes=background_bytes, accent_color=accent_color
         )

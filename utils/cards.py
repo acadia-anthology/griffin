@@ -297,6 +297,7 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> li
 def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[int],
                          total_gg: int, member_since: str,
                          bio: Optional[str], favorite_genres: Optional[str],
+                         books_checked_out: Optional[str] = None,
                          birthday: Optional[str] = None,
                          background_bytes: Optional[bytes] = None,
                          accent_color: Optional[tuple] = None) -> io.BytesIO:
@@ -336,6 +337,10 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
     genres_color = WHITE if favorite_genres else PLACEHOLDER
     genres_lines = _wrap_text(measure, genres_text, body_font, content_w)
 
+    books_text = books_checked_out or "Let them list what they've got checked out..."
+    books_color = WHITE if books_checked_out else PLACEHOLDER
+    books_lines = _wrap_text(measure, books_text, body_font, content_w)
+
     # --- accumulate total height ---
     y = banner_h + avatar_size // 2  # avatar straddles the banner/body seam
     y += s(20)
@@ -349,6 +354,8 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
     y += section_h + s(10) + line_h * len(bio_lines)
     y += s(28)
     y += section_h + s(10) + line_h * len(genres_lines)
+    y += s(28)
+    y += section_h + s(10) + line_h * len(books_lines)
     y += s(30)
     H = y
 
@@ -407,6 +414,13 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
     cy += section_h + s(10)
     for line in genres_lines:
         draw.text((pad_x, cy), line, font=body_font, fill=genres_color)
+        cy += line_h
+
+    cy += s(28)
+    draw.text((pad_x, cy), "BOOKS CHECKED OUT", font=section_font, fill=accent)
+    cy += section_h + s(10)
+    for line in books_lines:
+        draw.text((pad_x, cy), line, font=body_font, fill=books_color)
         cy += line_h
 
     buf = io.BytesIO()

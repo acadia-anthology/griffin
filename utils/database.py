@@ -49,11 +49,13 @@ class Database:
                 card_id INTEGER,
                 bio TEXT,
                 favorite_genres TEXT,
+                books_checked_out TEXT,
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
         await self._execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS bio TEXT;")
         await self._execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS favorite_genres TEXT;")
+        await self._execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS books_checked_out TEXT;")
         await self._execute("""
             CREATE TABLE IF NOT EXISTS library_cards (
                 id SERIAL PRIMARY KEY,
@@ -88,18 +90,24 @@ class Database:
 
     async def get_member(self, guild_id: int, user_id: int) -> dict:
         row = await self._fetchone(
-            "SELECT gg, card_id, bio, favorite_genres FROM members WHERE guild_id = %s AND user_id = %s",
+            "SELECT gg, card_id, bio, favorite_genres, books_checked_out "
+            "FROM members WHERE guild_id = %s AND user_id = %s",
             guild_id, user_id
         )
-        return row or {"gg": 0, "card_id": None, "bio": None, "favorite_genres": None}
+        return row or {
+            "gg": 0, "card_id": None, "bio": None,
+            "favorite_genres": None, "books_checked_out": None,
+        }
 
-    async def set_profile_text(self, guild_id: int, user_id: int, bio: str, favorite_genres: str):
+    async def set_profile_text(self, guild_id: int, user_id: int, bio: str, favorite_genres: str,
+                                books_checked_out: str):
         await self._execute("""
-            INSERT INTO members (guild_id, user_id, bio, favorite_genres)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO members (guild_id, user_id, bio, favorite_genres, books_checked_out)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (guild_id, user_id)
-            DO UPDATE SET bio = %s, favorite_genres = %s
-        """, guild_id, user_id, bio, favorite_genres, bio, favorite_genres)
+            DO UPDATE SET bio = %s, favorite_genres = %s, books_checked_out = %s
+        """, guild_id, user_id, bio, favorite_genres, books_checked_out,
+             bio, favorite_genres, books_checked_out)
 
     async def add_gg(self, guild_id: int, user_id: int, amount: int) -> int:
         row = await self._fetchone("""
