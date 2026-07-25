@@ -11,6 +11,14 @@ from utils import cards, levels
 
 VOICE_TICK_MINUTES = 5
 
+# Rank card tip prompt — TIP_URL is None until a real Ko-fi/PayPal link
+# exists, at which point the button just starts appearing automatically.
+TIP_URL = None
+TIP_FOOTER = (
+    "Goblins are notoriously underpaid — tipping keeps them from staging "
+    "a coup against librarians... again..."
+)
+
 
 async def _fetch_bytes(url: str) -> Optional[bytes]:
     try:
@@ -272,7 +280,16 @@ class PatronGroup(app_commands.Group):
             display_name, avatar_bytes, level, placement,
             stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color
         )
-        await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
+        embed = discord.Embed(color=discord.Color.gold())
+        embed.set_image(url="attachment://rank.png")
+        embed.set_footer(text=TIP_FOOTER)
+        view = None
+        if TIP_URL:
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(
+                label="🧌 Tip Your Favorite Goblin", style=discord.ButtonStyle.link, url=TIP_URL
+            ))
+        await interaction.followup.send(embed=embed, file=discord.File(buf, filename="rank.png"), view=view)
 
 
 class AddGroup(app_commands.Group):
