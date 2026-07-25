@@ -97,11 +97,11 @@ def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) ->
             x = (bg.width - w) // 2
             y = (bg.height - h) // 2
             bg = bg.crop((x, y, x + w, y + h))
-            # Wash the card's own background color over the art at 50% instead
+            # Wash the card's own background color over the art at 60% instead
             # of just darkening toward black — keeps text legible while tying
             # the art into the card's actual accent/background color.
             overlay = Image.new("RGB", (w, h), bg_color)
-            img = Image.blend(bg, overlay, 0.5)
+            img = Image.blend(bg, overlay, 0.6)
         except Exception:
             pass
     return img
