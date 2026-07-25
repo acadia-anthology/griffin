@@ -1,5 +1,6 @@
 import io
 import os
+import re as _re
 from typing import Optional
 
 from PIL import Image, ImageDraw, ImageFont
@@ -33,6 +34,38 @@ SCALE = 2
 
 def s(value: int) -> int:
     return round(value * SCALE)
+
+
+# Same approach Abraxos uses for names the card font can't render: keep Basic
+# Latin + Latin Extended (letters, accented Western/Eastern European chars,
+# numbers, common punctuation), strip emoji/symbols/decorative unicode
+# lookalikes that render as tofu boxes. Falls back to the Discord username
+# (restricted to safe characters by Discord itself) if the display name has
+# nothing legible left, and to a truncated raw fallback as a last resort.
+_EXTRA_NAME_CHARS = set('""\'\'—–…•·')
+
+
+def _clean_name(text: str) -> str:
+    out = []
+    for ch in text:
+        if ch == ' ':
+            out.append(' ')
+        elif (ord(ch) <= 0x024F and ch.isprintable()) or ch in _EXTRA_NAME_CHARS:
+            out.append(ch)
+    cleaned = _re.sub(r'\s+', ' ', "".join(out)).strip()
+    if cleaned and any(c.isalpha() or c.isdigit() for c in cleaned):
+        return cleaned
+    return ""
+
+
+def sanitize_name(name: str, fallback: str) -> str:
+    cleaned = _clean_name(name)
+    if cleaned:
+        return cleaned
+    cleaned_fallback = _clean_name(fallback)
+    if cleaned_fallback:
+        return cleaned_fallback
+    return fallback[:30]
 
 
 def parse_hex_color(value: str) -> Optional[tuple]:

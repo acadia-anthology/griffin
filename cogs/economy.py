@@ -47,8 +47,9 @@ async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, ol
     member_row = await db.get_member(guild.id, member.id)
     background_bytes, accent_color = await _get_card_visuals(db, guild.id, member_row)
     avatar_bytes = await member.display_avatar.read()
+    display_name = cards.sanitize_name(member.display_name, member.name)
     buf = cards.render_levelup_card(
-        member.display_name, avatar_bytes, old_level, new_level, background_bytes, accent_color
+        display_name, avatar_bytes, old_level, new_level, background_bytes, accent_color
     )
     try:
         await channel.send(
@@ -132,9 +133,10 @@ class PatronGroup(app_commands.Group):
         placement = await self.db.get_rank(interaction.guild.id, target.id)
         level, gg_into_level, gg_needed = levels.get_progress(stats["gg"])
         avatar_bytes = await target.display_avatar.read()
+        display_name = cards.sanitize_name(target.display_name, target.name)
         background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
         buf = cards.render_rank_card(
-            target.display_name, avatar_bytes, level, placement,
+            display_name, avatar_bytes, level, placement,
             stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color
         )
         await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
