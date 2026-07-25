@@ -452,7 +452,56 @@ class Economy(commands.Cog):
         await self.bot.wait_until_ready()
 
 
+@app_commands.command(name="help", description="Show what Griffin's commands can do.")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📚 Patron Commands",
+        color=discord.Color.gold(),
+        description="\n".join([
+            "**/patron board** — Show the Goblin Gold leaderboard",
+            "**/patron rank** `[member]` — Show a patron's Goblin Gold rank card",
+            "**/patron library-card view** `[member]` — Show a patron's library card",
+            "**/patron library-card update** — Browse/choose your library card design "
+            "and edit its bio, genres, and checked-out books",
+        ])
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+class ModGroup(app_commands.Group):
+    def __init__(self):
+        super().__init__(
+            name="mod",
+            description="Mod-only help",
+            default_permissions=discord.Permissions(manage_guild=True)
+        )
+
+    @app_commands.command(name="help", description="Show what Griffin's mod commands can do.")
+    async def help(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="🛠️ Mod Commands",
+            color=discord.Color.orange(),
+            description="\n".join([
+                "**/gg add member** `<member> <amount>` — Give Goblin Gold to a member",
+                "**/gg add library-card** `<name> <image> [accent_color]` — Add a new "
+                "library card design to the catalog",
+                "**/gg remove** `<member> <amount>` — Remove Goblin Gold from a member",
+                "**/gg setrate message** `<amount> <cooldown>` — Set GG earned per message "
+                "and its cooldown",
+                "**/gg setrate voice** `<amount> <per>` — Set GG earned per interval in "
+                "voice, prorated while connected",
+                "**/gg channelset levelup** `<channel>` — Set the channel for level-up "
+                "announcements",
+                "**/gg channelset assets** `<channel>` — Set the channel uploaded card art "
+                "gets archived to",
+            ])
+        )
+        await interaction.response.send_message(embed=embed)
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(Economy(bot))
     bot.tree.add_command(PatronGroup(bot.db))
     bot.tree.add_command(GGGroup(bot.db))
+    bot.tree.add_command(help_command)
+    bot.tree.add_command(ModGroup())
