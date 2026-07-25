@@ -155,7 +155,10 @@ def _progress_bar(draw: ImageDraw.ImageDraw, box, ratio: float, bar_bg, fill_col
 
 
 def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) -> Image.Image:
-    background_bytes = background_bytes or _load_default_background()
+    is_default = False
+    if not background_bytes:
+        background_bytes = _load_default_background()
+        is_default = background_bytes is not None
     img = Image.new("RGB", (w, h), bg_color)
     if background_bytes:
         try:
@@ -165,11 +168,16 @@ def _base_canvas(w: int, h: int, bg_color, background_bytes: Optional[bytes]) ->
             x = (bg.width - w) // 2
             y = (bg.height - h) // 2
             bg = bg.crop((x, y, x + w, y + h))
-            # Wash the card's own background color over the art at 60% instead
-            # of just darkening toward black — keeps text legible while tying
-            # the art into the card's actual accent/background color.
-            overlay = Image.new("RGB", (w, h), bg_color)
-            img = Image.blend(bg, overlay, 0.6)
+            if is_default:
+                # The bundled default is curated to already be legible —
+                # no need to wash it down like arbitrary uploaded art.
+                img = bg
+            else:
+                # Wash the card's own background color over the art at 60%
+                # instead of just darkening toward black — keeps text legible
+                # while tying the art into the card's accent/background color.
+                overlay = Image.new("RGB", (w, h), bg_color)
+                img = Image.blend(bg, overlay, 0.6)
         except Exception:
             pass
     return img
