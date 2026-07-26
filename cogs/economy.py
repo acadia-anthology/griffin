@@ -13,7 +13,7 @@ VOICE_TICK_MINUTES = 5
 
 # Rank card tip button — TIP_URL is None until a real Ko-fi/PayPal link
 # exists, at which point the button just starts appearing automatically.
-TIP_URL = "https://ko-fi.com/atmospherehq"
+TIP_URL = "https://ko-fi.com/i/IY3F523VI4F"
 
 
 async def _fetch_bytes(url: str) -> Optional[bytes]:
@@ -280,7 +280,7 @@ class PatronGroup(app_commands.Group):
         if TIP_URL:
             view = discord.ui.View()
             view.add_item(discord.ui.Button(
-                label="🧌 Bribe Griffin with Snacks & Tip the Developer: Atmosphere",
+                label="🧌 Tip Griffins Goblin King",
                 style=discord.ButtonStyle.link, url=TIP_URL
             ))
         await interaction.followup.send(file=discord.File(buf, filename="rank.png"), view=view)
