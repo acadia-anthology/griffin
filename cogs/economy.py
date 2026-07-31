@@ -424,8 +424,6 @@ class GGGroup(app_commands.Group):
         self.db = db
         self.add_command(AddGroup(db))
         self.add_command(SetRateGroup(db))
-        self.add_command(ChannelSetGroup(db))
-        self.add_command(SetRoleGroup(db))
 
     @app_commands.command(name="remove", description="Remove Goblin Gold from a member.")
     @app_commands.describe(member="Who to remove GG from", amount="How much GG to remove")
@@ -503,12 +501,15 @@ async def help_command(interaction: discord.Interaction):
 
 
 class ModGroup(app_commands.Group):
-    def __init__(self):
+    def __init__(self, db):
         super().__init__(
             name="mod",
-            description="Mod-only help",
+            description="Mod-only tools",
             default_permissions=discord.Permissions(manage_guild=True)
         )
+        self.db = db
+        self.add_command(ChannelSetGroup(db))
+        self.add_command(SetRoleGroup(db))
 
     @app_commands.command(name="help", description="Show what Griffin's mod commands can do.")
     async def help(self, interaction: discord.Interaction):
@@ -524,12 +525,12 @@ class ModGroup(app_commands.Group):
                 "and its cooldown",
                 "**/gg setrate voice** `<amount> <per>` — Set GG earned per interval in "
                 "voice, prorated while connected",
-                "**/gg channelset levelup** `<channel>` — Set the channel for level-up "
+                "**/mod channelset levelup** `<channel>` — Set the channel for level-up "
                 "announcements",
-                "**/gg channelset assets** `<channel>` — Set the channel uploaded card art "
+                "**/mod channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
-                "**/gg channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
-                "**/gg setrole sprint** `<role>` — Set the role pinged when a sprint starts",
+                "**/mod channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
+                "**/mod setrole sprint** `<role>` — Set the role pinged when a sprint starts",
             ])
         )
         await interaction.response.send_message(embed=embed)
@@ -540,4 +541,4 @@ async def setup(bot: commands.Bot):
     bot.tree.add_command(PatronGroup(bot.db))
     bot.tree.add_command(GGGroup(bot.db))
     bot.tree.add_command(help_command)
-    bot.tree.add_command(ModGroup())
+    bot.tree.add_command(ModGroup(bot.db))

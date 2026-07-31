@@ -628,13 +628,13 @@ class JoinSprintView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
-    @discord.ui.button(label="📖 Join Sprint", style=discord.ButtonStyle.primary, custom_id="sprint_join_btn", row=0)
+    @discord.ui.button(label="📖 Join Sprint", style=discord.ButtonStyle.success, custom_id="sprint_join_btn", row=0)
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
             "How would you like to track your sprint?", view=JoinTypeView(self.cog), ephemeral=True
         )
 
-    @discord.ui.button(label="🔄 Update Progress", style=discord.ButtonStyle.secondary, custom_id="sprint_update_btn", row=0)
+    @discord.ui.button(label="🔄 Update Progress", style=discord.ButtonStyle.success, custom_id="sprint_update_btn", row=0)
     async def update_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         row = await interaction.client.db._fetchone(
             "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
@@ -663,7 +663,7 @@ class LogProgressView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
-    @discord.ui.button(label="📝 Log Sprint", style=discord.ButtonStyle.primary, custom_id="sprint_log_btn", row=0)
+    @discord.ui.button(label="📝 Log Sprint", style=discord.ButtonStyle.success, custom_id="sprint_log_btn", row=0)
     async def log_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         row = await interaction.client.db._fetchone(
             "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
@@ -747,6 +747,7 @@ class Sprints(commands.Cog):
                 "role_id": row["role_id"],
                 "participants": participants,
                 "join_message_id": row.get("join_message_id"),
+                "started": now >= start_time,
             }
             active_sprints[guild.id] = sprint
 
@@ -759,35 +760,45 @@ class Sprints(commands.Cog):
 
     # ── Build the sprint embed ────────────────────────────────────────────────
 
-    def _build_sprint_embed(self, guild_id, start_time, end_time, host_name, duration, host_avatar=None):
+    def _build_sprint_embed(self, guild_id, start_time, end_time, host_name, duration, started: bool = False):
         sprint = active_sprints.get(guild_id)
         participants = sprint["participants"] if sprint else {}
-        embed = discord.Embed(title="📖 Sprint Starting Soon!", color=discord.Color.teal())
-        embed.add_field(name="Duration", value=f"{duration} minutes", inline=True)
-        embed.add_field(name="Starts", value=f"{discord.utils.format_dt(start_time, 'R')}\n{discord.utils.format_dt(start_time, 't')}", inline=True)
-        embed.add_field(name="Ends", value=f"{discord.utils.format_dt(end_time, 'R')}\n{discord.utils.format_dt(end_time, 't')}", inline=True)
+
+        title_line = (
+            "📣 **__READING SPRINT STARTED!__**" if started
+            else "📣 **__Reading Sprint Starting Soon!__**"
+        )
+        lines = [
+            title_line,
+            "",
+            f"🧌 **Host:** {host_name}",
+            f"⏳ **Start Time:** {discord.utils.format_dt(start_time, 'F')} "
+            f"*({discord.utils.format_dt(start_time, 'R')})*",
+            f"🏁 **End Time:** {discord.utils.format_dt(end_time, 'F')} "
+            f"*({discord.utils.format_dt(end_time, 'R')})*",
+        ]
+        embed = discord.Embed(description="\n".join(lines), color=discord.Color.gold())
 
         if participants:
-            lines = []
+            p_lines = []
             for uid, data in participants.items():
                 title = data.get("title") or ""
                 ptype = data["type"]
+                suffix = f" of **{title}**" if title else ""
                 if ptype == "audio":
                     h, m = data["start"]
                     pos = f"{h}h {m}m" if h else f"{m}m"
-                    lines.append(f"🎧 <@{uid}> — {pos}" + (f" — *{title}*" if title else ""))
+                    p_lines.append(f"📌 <@{uid}> - {pos}{suffix}")
                 elif ptype in ("ebook_pct", "audio_pct"):
-                    emoji = "📱" if ptype == "ebook_pct" else "🎙️"
-                    lines.append(f"{emoji} <@{uid}> — {data['start']:.1f}%" + (f" — *{title}*" if title else ""))
+                    p_lines.append(f"📌 <@{uid}> - {data['start']:.1f}%{suffix}")
                 else:
-                    lines.append(f"📖 <@{uid}> — page {data['start']}" + (f" — *{title}*" if title else ""))
-            embed.add_field(name="Sprint Participants", value="\n".join(lines), inline=False)
+                    p_lines.append(f"📌 <@{uid}> - Page {data['start']}{suffix}")
+            embed.add_field(name="📖 Sprint Participants:", value="\n".join(p_lines), inline=False)
         else:
-            embed.add_field(name="Sprint Participants", value="No participants yet", inline=False)
+            embed.add_field(name="📖 Sprint Participants:", value="No participants yet", inline=False)
 
         guild = self.bot.get_guild(guild_id)
         server_icon = guild.icon.url if guild and guild.icon else None
-        embed.set_footer(text=f"Hosted by {host_name}", icon_url=host_avatar)
         if server_icon:
             embed.set_thumbnail(url=server_icon)
         return embed
@@ -808,9 +819,9 @@ class Sprints(commands.Cog):
             msg = await channel.fetch_message(sprint["join_message_id"])
             host = guild.get_member(sprint["host"])
             host_name = host.display_name if host else "Unknown"
-            host_avatar = host.display_avatar.url if host else None
             embed = self._build_sprint_embed(
-                guild.id, start_time, end_time, host_name, sprint["duration"], host_avatar
+                guild.id, start_time, end_time, host_name, sprint["duration"],
+                started=sprint.get("started", False)
             )
             await msg.edit(embed=embed)
         except Exception:
@@ -863,12 +874,12 @@ class Sprints(commands.Cog):
             "role_id": role_id,
             "participants": {},
             "join_message_id": None,
+            "started": False,
         }
         active_sprints[guild_id] = sprint_data
 
         embed = self._build_sprint_embed(
-            guild_id, start_time, end_time, interaction.user.display_name, duration_minutes,
-            interaction.user.display_avatar.url
+            guild_id, start_time, end_time, interaction.user.display_name, duration_minutes
         )
         view = JoinSprintView(self)
 
@@ -891,15 +902,25 @@ class Sprints(commands.Cog):
         if guild_id not in active_sprints:
             return
 
+        active_sprints[guild_id]["started"] = True
         channel = await _get_channel(interaction.guild, interaction.channel.id)
         if channel:
             participant_ids = list(active_sprints.get(guild_id, {}).get("participants", {}).keys())
-            participant_mentions = " ".join(f"<@{uid}>" for uid in participant_ids) if participant_ids else ""
-            await channel.send(
-                f"{participant_mentions + ' ' if participant_mentions else ''}🏃 **Sprint started!** "
-                f"You have **{duration_minutes} minutes**. Go go go!",
-                allowed_mentions=discord.AllowedMentions(users=True),
+            participant_mentions = " ".join(f"<@{uid}>" for uid in participant_ids) if participant_ids else None
+            started_embed = self._build_sprint_embed(
+                guild_id, start_time, end_time, interaction.user.display_name, duration_minutes,
+                started=True
             )
+            try:
+                msg = await channel.fetch_message(active_sprints[guild_id]["join_message_id"])
+                await msg.edit(content=participant_mentions, embed=started_embed,
+                                allowed_mentions=discord.AllowedMentions(users=True))
+            except Exception:
+                await channel.send(
+                    f"{participant_mentions + ' ' if participant_mentions else ''}🏃 **Sprint started!** "
+                    f"You have **{duration_minutes} minutes**. Go go go!",
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
 
         await asyncio.sleep(duration_minutes * 60)
         await self._finish_sprint(interaction.guild)
