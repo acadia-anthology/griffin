@@ -816,11 +816,11 @@ class Sprints(commands.Cog):
         except Exception:
             pass
 
-    # ── /sprint start ─────────────────────────────────────────────────────────
+    # ── /race start ─────────────────────────────────────────────────────────
 
-    sprint = app_commands.Group(name="sprint", description="Sprint commands")
+    race = app_commands.Group(name="race", description="Sprint race commands")
 
-    @sprint.command(name="start", description="Start a reading/writing sprint!")
+    @race.command(name="start", description="Start a reading/writing sprint!")
     @app_commands.describe(
         duration_minutes="How many minutes the sprint lasts (max 120)",
         countdown_seconds="Seconds before the sprint begins (default 30)"
@@ -905,9 +905,9 @@ class Sprints(commands.Cog):
         await self._finish_sprint(interaction.guild)
 
 
-    # ── /sprint edit ──────────────────────────────────────────────────────────
+    # ── /race edit ──────────────────────────────────────────────────────────
 
-    @sprint.command(name="edit", description="Edit or delete one of your sprint logs")
+    @race.command(name="edit", description="Edit or delete one of your sprint logs")
     async def sprint_edit(self, interaction: discord.Interaction):
         logs = await self.bot.db.get_sprint_logs(interaction.guild.id, interaction.user.id, limit=10)
         if not logs:
@@ -918,9 +918,9 @@ class Sprints(commands.Cog):
             "Select a sprint log to edit or delete:", view=view, ephemeral=True
         )
 
-    # ── /sprint stats ─────────────────────────────────────────────────────────
+    # ── /race stats ─────────────────────────────────────────────────────────
 
-    @sprint.command(name="stats", description="View sprint stats for yourself or another member")
+    @race.command(name="stats", description="View sprint stats for yourself or another member")
     @app_commands.describe(member="Whose stats to view (defaults to you)")
     async def sprint_stats(self, interaction: discord.Interaction, member: discord.Member = None):
         await interaction.response.defer()
@@ -943,9 +943,9 @@ class Sprints(commands.Cog):
             embed.add_field(name="🫣 Unlogged Sprints", value=str(unlogged))
         await interaction.followup.send(embed=embed)
 
-    # ── /sprint leaderboard ───────────────────────────────────────────────────
+    # ── /race leaderboard ───────────────────────────────────────────────────
 
-    @sprint.command(name="leaderboard", description="View the sprint leaderboard")
+    @race.command(name="leaderboard", description="View the sprint leaderboard")
     async def sprint_leaderboard(self, interaction: discord.Interaction):
         await interaction.response.defer()
         rows = await self.bot.db.get_sprint_leaderboard(interaction.guild.id)

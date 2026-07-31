@@ -395,7 +395,7 @@ class ChannelSetGroup(app_commands.Group):
         await self.db.set_assets_channel(interaction.guild.id, channel.id)
         await interaction.response.send_message(f"✅ Card art will be archived in {channel.mention}.")
 
-    @app_commands.command(name="sprint", description="Restrict /sprint start to a single channel (optional).")
+    @app_commands.command(name="sprint", description="Restrict /race start to a single channel (optional).")
     @app_commands.describe(channel="Channel where sprints can be started")
     async def sprint(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await self.db.set_sprint_channel(interaction.guild.id, channel.id)
@@ -493,10 +493,10 @@ async def help_command(interaction: discord.Interaction):
             "**/patron library-card view** `[member]` — Show a patron's library card",
             "**/patron library-card update** — Browse/choose your library card design "
             "and edit its bio, genres, and checked-out books",
-            "**/sprint start** `<duration_minutes> [countdown_seconds]` — Start a reading/writing sprint",
-            "**/sprint stats** `[member]` — View sprint stats for yourself or another member",
-            "**/sprint leaderboard** — View the sprint leaderboard",
-            "**/sprint edit** — Edit or delete one of your sprint logs",
+            "**/race start** `<duration_minutes> [countdown_seconds]` — Start a reading/writing sprint",
+            "**/race stats** `[member]` — View sprint stats for yourself or another member",
+            "**/race leaderboard** — View the sprint leaderboard",
+            "**/race edit** — Edit or delete one of your sprint logs",
         ])
     )
     await interaction.response.send_message(embed=embed)
@@ -528,7 +528,7 @@ class ModGroup(app_commands.Group):
                 "announcements",
                 "**/gg channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
-                "**/gg channelset sprint** `<channel>` — Restrict `/sprint start` to a single channel",
+                "**/gg channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
                 "**/gg setrole sprint** `<role>` — Set the role pinged when a sprint starts",
             ])
         )
