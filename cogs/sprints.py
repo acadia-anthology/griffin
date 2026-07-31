@@ -760,8 +760,12 @@ class Sprints(commands.Cog):
 
     # ── Build the sprint embed ────────────────────────────────────────────────
 
-    def _build_sprint_embed(self, guild_id, start_time, end_time, host_name, duration, started: bool = False):
-        sprint = active_sprints.get(guild_id)
+    # Discord's hard cap per embed field value.
+    _FIELD_LIMIT = 1000
+
+    def _build_sprint_embeds(self, guild: discord.Guild, start_time, end_time, host_name, duration,
+                              started: bool = False) -> list[discord.Embed]:
+        sprint = active_sprints.get(guild.id)
         participants = sprint["participants"] if sprint else {}
 
         title_line = (
@@ -777,31 +781,52 @@ class Sprints(commands.Cog):
             f"🏁 **End Time:** {discord.utils.format_dt(end_time, 'F')} "
             f"*({discord.utils.format_dt(end_time, 'R')})*",
         ]
-        embed = discord.Embed(description="\n".join(lines), color=discord.Color.gold())
+        main_embed = discord.Embed(description="\n".join(lines), color=discord.Color.gold())
 
-        if participants:
-            p_lines = []
-            for uid, data in participants.items():
-                title = data.get("title") or ""
-                ptype = data["type"]
-                suffix = f" of **{title}**" if title else ""
-                if ptype == "audio":
-                    h, m = data["start"]
-                    pos = f"{h}h {m}m" if h else f"{m}m"
-                    p_lines.append(f"📌 <@{uid}> - {pos}{suffix}")
-                elif ptype in ("ebook_pct", "audio_pct"):
-                    p_lines.append(f"📌 <@{uid}> - {data['start']:.1f}%{suffix}")
-                else:
-                    p_lines.append(f"📌 <@{uid}> - Page {data['start']}{suffix}")
-            embed.add_field(name="📖 Sprint Participants:", value="\n".join(p_lines), inline=False)
-        else:
-            embed.add_field(name="📖 Sprint Participants:", value="No participants yet", inline=False)
-
-        guild = self.bot.get_guild(guild_id)
-        server_icon = guild.icon.url if guild and guild.icon else None
+        server_icon = guild.icon.url if guild.icon else None
         if server_icon:
-            embed.set_thumbnail(url=server_icon)
-        return embed
+            main_embed.set_thumbnail(url=server_icon)
+
+        if not participants:
+            main_embed.add_field(name="📖 Sprint Participants:", value="No participants yet", inline=False)
+            return [main_embed]
+
+        p_lines = []
+        for uid, data in participants.items():
+            title = data.get("title") or ""
+            ptype = data["type"]
+            suffix = f" of **{title}**" if title else ""
+            if ptype == "audio":
+                h, m = data["start"]
+                pos = f"{h}h {m}m" if h else f"{m}m"
+                p_lines.append(f"📌 <@{uid}> - {pos}{suffix}")
+            elif ptype in ("ebook_pct", "audio_pct"):
+                p_lines.append(f"📌 <@{uid}> - {data['start']:.1f}%{suffix}")
+            else:
+                p_lines.append(f"📌 <@{uid}> - Page {data['start']}{suffix}")
+
+        # Full roster always shows — chunk across fields since a single field
+        # caps out at 1024 chars and groups can run 10-30+ deep.
+        first = True
+        chunk = ""
+        for line in p_lines:
+            candidate = f"{chunk}\n{line}" if chunk else line
+            if len(candidate) > self._FIELD_LIMIT:
+                main_embed.add_field(
+                    name="📖 Sprint Participants:" if first else "​",
+                    value=chunk, inline=False
+                )
+                first = False
+                chunk = line
+            else:
+                chunk = candidate
+        if chunk:
+            main_embed.add_field(
+                name="📖 Sprint Participants:" if first else "​",
+                value=chunk, inline=False
+            )
+
+        return [main_embed]
 
     async def _update_join_embed(self, guild):
         """Edit the sprint announcement embed to show updated participants."""
@@ -819,11 +844,11 @@ class Sprints(commands.Cog):
             msg = await channel.fetch_message(sprint["join_message_id"])
             host = guild.get_member(sprint["host"])
             host_name = host.display_name if host else "Unknown"
-            embed = self._build_sprint_embed(
-                guild.id, start_time, end_time, host_name, sprint["duration"],
+            embeds = self._build_sprint_embeds(
+                guild, start_time, end_time, host_name, sprint["duration"],
                 started=sprint.get("started", False)
             )
-            await msg.edit(embed=embed)
+            await msg.edit(embeds=embeds)
         except Exception:
             pass
 
@@ -878,14 +903,14 @@ class Sprints(commands.Cog):
         }
         active_sprints[guild_id] = sprint_data
 
-        embed = self._build_sprint_embed(
-            guild_id, start_time, end_time, interaction.user.display_name, duration_minutes
+        embeds = self._build_sprint_embeds(
+            interaction.guild, start_time, end_time, interaction.user.display_name, duration_minutes
         )
         view = JoinSprintView(self)
 
         await interaction.response.send_message(
             content=role_mention if role_mention else None,
-            embed=embed,
+            embeds=embeds,
             view=view,
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
@@ -907,13 +932,13 @@ class Sprints(commands.Cog):
         if channel:
             participant_ids = list(active_sprints.get(guild_id, {}).get("participants", {}).keys())
             participant_mentions = " ".join(f"<@{uid}>" for uid in participant_ids) if participant_ids else None
-            started_embed = self._build_sprint_embed(
-                guild_id, start_time, end_time, interaction.user.display_name, duration_minutes,
+            started_embeds = self._build_sprint_embeds(
+                interaction.guild, start_time, end_time, interaction.user.display_name, duration_minutes,
                 started=True
             )
             try:
                 msg = await channel.fetch_message(active_sprints[guild_id]["join_message_id"])
-                await msg.edit(content=participant_mentions, embed=started_embed,
+                await msg.edit(content=participant_mentions, embeds=started_embeds,
                                 allowed_mentions=discord.AllowedMentions(users=True))
             except Exception:
                 await channel.send(
