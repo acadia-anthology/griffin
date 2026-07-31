@@ -13,7 +13,7 @@ VOICE_TICK_MINUTES = 5
 
 # Rank card tip button — TIP_URL is None until a real Ko-fi/PayPal link
 # exists, at which point the button just starts appearing automatically.
-TIP_URL = "https://ko-fi.com/i/IY3F523VI4F"
+TIP_URL = "https://ko-fi.com/atmospherehq"
 
 
 async def _fetch_bytes(url: str) -> Optional[bytes]:
@@ -395,6 +395,24 @@ class ChannelSetGroup(app_commands.Group):
         await self.db.set_assets_channel(interaction.guild.id, channel.id)
         await interaction.response.send_message(f"✅ Card art will be archived in {channel.mention}.")
 
+    @app_commands.command(name="sprint", description="Restrict /sprint start to a single channel (optional).")
+    @app_commands.describe(channel="Channel where sprints can be started")
+    async def sprint(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await self.db.set_sprint_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ Sprints can now only be started in {channel.mention}.")
+
+
+class SetRoleGroup(app_commands.Group):
+    def __init__(self, db):
+        super().__init__(name="setrole", description="Configure roles Griffin pings")
+        self.db = db
+
+    @app_commands.command(name="sprint", description="Set the role pinged when a sprint starts.")
+    @app_commands.describe(role="Role to ping for sprints")
+    async def sprint(self, interaction: discord.Interaction, role: discord.Role):
+        await self.db.set_sprint_role(interaction.guild.id, role.id)
+        await interaction.response.send_message(f"✅ Sprints will now ping {role.mention}.")
+
 
 class GGGroup(app_commands.Group):
     def __init__(self, db):
@@ -407,6 +425,7 @@ class GGGroup(app_commands.Group):
         self.add_command(AddGroup(db))
         self.add_command(SetRateGroup(db))
         self.add_command(ChannelSetGroup(db))
+        self.add_command(SetRoleGroup(db))
 
     @app_commands.command(name="remove", description="Remove Goblin Gold from a member.")
     @app_commands.describe(member="Who to remove GG from", amount="How much GG to remove")
@@ -474,6 +493,10 @@ async def help_command(interaction: discord.Interaction):
             "**/patron library-card view** `[member]` — Show a patron's library card",
             "**/patron library-card update** — Browse/choose your library card design "
             "and edit its bio, genres, and checked-out books",
+            "**/sprint start** `<duration_minutes> [countdown_seconds]` — Start a reading/writing sprint",
+            "**/sprint stats** `[member]` — View sprint stats for yourself or another member",
+            "**/sprint leaderboard** — View the sprint leaderboard",
+            "**/sprint edit** — Edit or delete one of your sprint logs",
         ])
     )
     await interaction.response.send_message(embed=embed)
@@ -505,6 +528,8 @@ class ModGroup(app_commands.Group):
                 "announcements",
                 "**/gg channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
+                "**/gg channelset sprint** `<channel>` — Restrict `/sprint start` to a single channel",
+                "**/gg setrole sprint** `<role>` — Set the role pinged when a sprint starts",
             ])
         )
         await interaction.response.send_message(embed=embed)

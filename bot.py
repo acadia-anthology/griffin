@@ -42,6 +42,7 @@ class Griffin(commands.Bot):
         cogs = [
             "cogs.core",
             "cogs.economy",
+            "cogs.sprints",
         ]
         for cog in cogs:
             await self.load_extension(cog)

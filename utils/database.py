@@ -83,6 +83,67 @@ class Database:
             )
         """)
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS assets_channel_id BIGINT;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_channel_id BIGINT;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_role_id BIGINT;")
+
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS sprints (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT,
+                channel_id BIGINT,
+                host_id BIGINT,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                duration_minutes INTEGER
+            )
+        """)
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS sprint_participants (
+                sprint_id INTEGER REFERENCES sprints(id),
+                user_id BIGINT,
+                start_count INTEGER DEFAULT 0,
+                end_count INTEGER,
+                type TEXT DEFAULT 'pages',
+                title TEXT,
+                joined_at TIMESTAMP,
+                sprint_end_time TIMESTAMP,
+                PRIMARY KEY (sprint_id, user_id)
+            )
+        """)
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS active_sprint (
+                guild_id BIGINT PRIMARY KEY,
+                host_id BIGINT,
+                channel_id BIGINT,
+                duration_minutes INTEGER,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                role_id BIGINT,
+                join_message_id BIGINT
+            )
+        """)
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS active_sprint_participants (
+                guild_id BIGINT,
+                user_id BIGINT,
+                type TEXT,
+                title TEXT,
+                start_val TEXT,
+                end_val TEXT,
+                joined_at TIMESTAMP,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS sprint_book_meta (
+                user_id BIGINT NOT NULL,
+                guild_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                total_pages INTEGER,
+                total_minutes INTEGER,
+                PRIMARY KEY (user_id, guild_id, title)
+            )
+        """)
 
     # --- members / GG ---
     # GG is purely cosmetic (rank + bragging rights) — nothing spends it, so
@@ -186,7 +247,7 @@ class Database:
     async def get_guild_config(self, guild_id: int) -> dict:
         row = await self._fetchone(
             "SELECT message_rate, message_cooldown, voice_rate, voice_interval, "
-            "levelup_channel_id, assets_channel_id "
+            "levelup_channel_id, assets_channel_id, sprint_channel_id, sprint_role_id "
             "FROM guild_config WHERE guild_id = %s",
             guild_id
         )
@@ -199,6 +260,8 @@ class Database:
             "voice_interval": DEFAULT_VOICE_INTERVAL,
             "levelup_channel_id": None,
             "assets_channel_id": None,
+            "sprint_channel_id": None,
+            "sprint_role_id": None,
         }
 
     async def set_levelup_channel(self, guild_id: int, channel_id: int):
@@ -217,6 +280,22 @@ class Database:
             DO UPDATE SET assets_channel_id = %s
         """, guild_id, channel_id, channel_id)
 
+    async def set_sprint_channel(self, guild_id: int, channel_id: int):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, sprint_channel_id)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET sprint_channel_id = %s
+        """, guild_id, channel_id, channel_id)
+
+    async def set_sprint_role(self, guild_id: int, role_id: int):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, sprint_role_id)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET sprint_role_id = %s
+        """, guild_id, role_id, role_id)
+
     async def set_message_rate(self, guild_id: int, amount: int, cooldown: int):
         await self._execute("""
             INSERT INTO guild_config (guild_id, message_rate, message_cooldown)
@@ -232,3 +311,157 @@ class Database:
             ON CONFLICT (guild_id)
             DO UPDATE SET voice_rate = %s, voice_interval = %s
         """, guild_id, amount, interval, amount, interval)
+
+    # --- sprints ---
+
+    async def create_sprint(self, guild_id: int, channel_id: int, host_id: int,
+                             start_time, end_time, duration_minutes: int) -> int:
+        row = await self._fetchone("""
+            INSERT INTO sprints (guild_id, channel_id, host_id, start_time, end_time, duration_minutes)
+            VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+        """, guild_id, channel_id, host_id, start_time, end_time, duration_minutes)
+        return row["id"]
+
+    async def add_sprint_participant(self, sprint_id: int, user_id: int, start_count: int, end_count,
+                                      ptype: str = "pages", joined_at=None, sprint_end_time=None, title: str = None):
+        await self._execute(
+            "INSERT INTO sprint_participants (sprint_id, user_id, start_count, end_count, type, joined_at, sprint_end_time, title) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            sprint_id, user_id, start_count, end_count, ptype, joined_at, sprint_end_time, title
+        )
+
+    async def get_sprint_logs(self, guild_id: int, user_id: int, limit: int = 10) -> list:
+        return await self._fetchall("""
+            SELECT sp.sprint_id, sp.title, sp.type, sp.start_count, sp.end_count, sp.sprint_end_time
+            FROM sprint_participants sp
+            JOIN sprints s ON s.id = sp.sprint_id
+            WHERE s.guild_id=%s AND sp.user_id=%s AND sp.end_count IS NOT NULL
+            ORDER BY sp.sprint_end_time DESC NULLS LAST
+            LIMIT %s
+        """, guild_id, user_id, limit)
+
+    async def update_sprint_log(self, sprint_id: int, user_id: int, start_count: int, end_count: int, title: Optional[str] = None):
+        await self._execute(
+            "UPDATE sprint_participants SET start_count=%s, end_count=%s, title=COALESCE(%s, title) WHERE sprint_id=%s AND user_id=%s",
+            start_count, end_count, title, sprint_id, user_id
+        )
+
+    async def delete_sprint_log(self, sprint_id: int, user_id: int):
+        await self._execute(
+            "DELETE FROM sprint_participants WHERE sprint_id=%s AND user_id=%s",
+            sprint_id, user_id
+        )
+
+    async def get_sprint_stats(self, guild_id: int, user_id: int) -> dict:
+        return await self._fetchone("""
+            SELECT COUNT(*) FILTER (WHERE sp.end_count IS NOT NULL) AS sprints_completed,
+                   COALESCE(SUM(CASE WHEN sp.type='pages' AND sp.end_count IS NOT NULL THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_pages,
+                   COALESCE(SUM(CASE WHEN sp.type='audio' AND sp.end_count IS NOT NULL THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_audio_minutes,
+                   COUNT(*) FILTER (WHERE sp.end_count IS NULL) AS unlogged_sprints
+            FROM sprint_participants sp
+            JOIN sprints s ON s.id = sp.sprint_id
+            WHERE s.guild_id=%s AND sp.user_id=%s
+        """, guild_id, user_id)
+
+    async def get_sprint_history(self, guild_id: int, user_id: int, limit: int = 20) -> list:
+        return await self._fetchall("""
+            SELECT sp.title, sp.type,
+                   SUM(sp.end_count - sp.start_count) AS progress,
+                   MIN(sp.sprint_end_time) AS first_date,
+                   MAX(sp.sprint_end_time) AS last_date,
+                   COUNT(*) AS session_count
+            FROM sprint_participants sp
+            JOIN sprints s ON s.id = sp.sprint_id
+            WHERE s.guild_id=%s AND sp.user_id=%s AND sp.end_count IS NOT NULL AND sp.title IS NOT NULL
+            GROUP BY sp.title, sp.type
+            ORDER BY MAX(sp.sprint_end_time) DESC NULLS LAST
+            LIMIT %s
+        """, guild_id, user_id, limit)
+
+    async def get_recent_sprint_titles(self, guild_id: int, user_id: int, limit: int = 5) -> list:
+        return await self._fetchall("""
+            SELECT title, type, last_used FROM (
+                SELECT sp.title,
+                       (array_agg(sp.type ORDER BY sp.sprint_end_time DESC NULLS LAST))[1] AS type,
+                       MAX(sp.sprint_end_time) AS last_used
+                FROM sprint_participants sp
+                JOIN sprints s ON s.id = sp.sprint_id
+                WHERE s.guild_id=%s AND sp.user_id=%s AND sp.title IS NOT NULL
+                GROUP BY sp.title
+            ) sub
+            ORDER BY last_used DESC NULLS LAST
+            LIMIT %s
+        """, guild_id, user_id, limit)
+
+    async def get_sprint_book_meta(self, user_id: int, guild_id: int, title: str) -> Optional[dict]:
+        return await self._fetchone(
+            "SELECT * FROM sprint_book_meta WHERE user_id=%s AND guild_id=%s AND title=%s",
+            user_id, guild_id, title
+        )
+
+    async def save_sprint_book_meta(self, user_id: int, guild_id: int, title: str,
+                                     total_pages: Optional[int] = None, total_minutes: Optional[int] = None):
+        await self._execute(
+            """INSERT INTO sprint_book_meta (user_id, guild_id, title, total_pages, total_minutes)
+               VALUES (%s,%s,%s,%s,%s)
+               ON CONFLICT (user_id, guild_id, title)
+               DO UPDATE SET
+                 total_pages = COALESCE(%s, sprint_book_meta.total_pages),
+                 total_minutes = COALESCE(%s, sprint_book_meta.total_minutes)""",
+            user_id, guild_id, title, total_pages, total_minutes, total_pages, total_minutes
+        )
+
+    async def get_sprint_leaderboard(self, guild_id: int, limit: int = 10) -> list:
+        return await self._fetchall("""
+            SELECT sp.user_id,
+                   COUNT(*) AS sprints_completed,
+                   COALESCE(SUM(CASE WHEN sp.type='pages' THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_pages,
+                   COALESCE(SUM(CASE WHEN sp.type='audio' THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_audio_minutes
+            FROM sprint_participants sp
+            JOIN sprints s ON s.id = sp.sprint_id
+            WHERE s.guild_id=%s AND sp.end_count IS NOT NULL
+            GROUP BY sp.user_id
+            ORDER BY sprints_completed DESC, total_pages DESC
+            LIMIT %s
+        """, guild_id, limit)
+
+    # --- active sprint persistence ---
+
+    async def save_active_sprint(self, guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id):
+        await self._execute("DELETE FROM active_sprint WHERE guild_id=%s", guild_id)
+        await self._execute("""
+            INSERT INTO active_sprint (guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id)
+
+    async def update_sprint_message_id(self, guild_id, message_id):
+        await self._execute(
+            "UPDATE active_sprint SET join_message_id=%s WHERE guild_id=%s",
+            message_id, guild_id
+        )
+
+    async def get_active_sprint(self, guild_id) -> Optional[dict]:
+        return await self._fetchone("SELECT * FROM active_sprint WHERE guild_id=%s", guild_id)
+
+    async def delete_active_sprint(self, guild_id):
+        await self._execute("DELETE FROM active_sprint WHERE guild_id=%s", guild_id)
+        await self._execute("DELETE FROM active_sprint_participants WHERE guild_id=%s", guild_id)
+
+    async def save_sprint_participant(self, guild_id, user_id, ptype, title, start_val, end_val=None, joined_at=None):
+        from datetime import datetime
+        joined_at = joined_at or datetime.utcnow()
+        await self._execute("""
+            INSERT INTO active_sprint_participants (guild_id, user_id, type, title, start_val, end_val, joined_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET type=%s, title=%s, start_val=%s, end_val=%s, joined_at=COALESCE(active_sprint_participants.joined_at, %s)
+        """, guild_id, user_id, ptype, title, start_val, end_val, joined_at,
+             ptype, title, start_val, end_val, joined_at)
+
+    async def update_sprint_participant_end(self, guild_id, user_id, end_val):
+        await self._execute(
+            "UPDATE active_sprint_participants SET end_val=%s WHERE guild_id=%s AND user_id=%s",
+            end_val, guild_id, user_id
+        )
+
+    async def get_sprint_participants(self, guild_id) -> list:
+        return await self._fetchall("SELECT * FROM active_sprint_participants WHERE guild_id=%s", guild_id)
