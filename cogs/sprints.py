@@ -913,8 +913,10 @@ class Sprints(commands.Cog):
             return
 
         manager_role_id = settings.get("sprint_manager_role_id")
-        if manager_role_id:
-            has_role = any(r.id == manager_role_id for r in getattr(interaction.user, "roles", []))
+        griffin_manager_role_id = settings.get("griffin_manager_role_id")
+        if manager_role_id or griffin_manager_role_id:
+            user_role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
+            has_role = manager_role_id in user_role_ids or griffin_manager_role_id in user_role_ids
             if not has_role and not interaction.user.guild_permissions.manage_guild:
                 await interaction.response.send_message(
                     "❌ You don't have permission to start sprints.", ephemeral=True

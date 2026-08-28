@@ -287,7 +287,26 @@ class PatronGroup(app_commands.Group):
         await interaction.followup.send(file=discord.File(buf, filename="rank.png"), view=view)
 
 
-class AddGroup(app_commands.Group):
+class GriffinModGroup(app_commands.Group):
+    """Base for Griffin's mod-only command groups. Lets a configured
+    griffin_manager_role use these commands without real Manage Server
+    permission — every group in a nested chain needs this check, since
+    discord.py only consults a command's *immediate* parent group."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.guild_permissions.manage_guild:
+            return True
+        db = getattr(self, "db", None)
+        if db is None:
+            return False
+        config = await db.get_guild_config(interaction.guild.id)
+        manager_role_id = config.get("griffin_manager_role_id")
+        return bool(manager_role_id) and any(
+            r.id == manager_role_id for r in getattr(interaction.user, "roles", [])
+        )
+
+
+class AddGroup(GriffinModGroup):
     def __init__(self, db):
         super().__init__(name="add", description="Add GG or a new library card")
         self.db = db
@@ -341,7 +360,7 @@ class AddGroup(app_commands.Group):
         await interaction.followup.send(f"✅ Added library card **{name}** to the catalog.{note}")
 
 
-class SetRateGroup(app_commands.Group):
+class SetRateGroup(GriffinModGroup):
     def __init__(self, db):
         super().__init__(name="setrate", description="Configure passive Goblin Gold earn rates")
         self.db = db
@@ -379,7 +398,7 @@ class SetRateGroup(app_commands.Group):
         )
 
 
-class ChannelSetGroup(app_commands.Group):
+class ChannelSetGroup(GriffinModGroup):
     def __init__(self, db):
         super().__init__(name="channelset", description="Configure channels Griffin posts to")
         self.db = db
@@ -403,7 +422,7 @@ class ChannelSetGroup(app_commands.Group):
         await interaction.response.send_message(f"✅ Sprints can now only be started in {channel.mention}.")
 
 
-class RaceConfigGroup(app_commands.Group):
+class RaceConfigGroup(GriffinModGroup):
     def __init__(self, db):
         super().__init__(name="race", description="Configure sprint/race settings")
         self.db = db
@@ -446,13 +465,9 @@ class RaceConfigGroup(app_commands.Group):
         )
 
 
-class GGGroup(app_commands.Group):
+class GGGroup(GriffinModGroup):
     def __init__(self, db):
-        super().__init__(
-            name="gg",
-            description="Goblin Gold moderation tools",
-            default_permissions=discord.Permissions(manage_guild=True)
-        )
+        super().__init__(name="gg", description="Goblin Gold moderation tools")
         self.db = db
         self.add_command(AddGroup(db))
         self.add_command(SetRateGroup(db))
@@ -532,16 +547,32 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-class ModGroup(app_commands.Group):
+class ModGroup(GriffinModGroup):
     def __init__(self, db):
-        super().__init__(
-            name="mod",
-            description="Mod-only tools",
-            default_permissions=discord.Permissions(manage_guild=True)
-        )
+        super().__init__(name="mod", description="Mod-only tools")
         self.db = db
         self.add_command(ChannelSetGroup(db))
         self.add_command(RaceConfigGroup(db))
+
+    @app_commands.command(
+        name="manager-role",
+        description="Set (or clear) the role that can use all of Griffin's mod commands without Manage Server."
+    )
+    @app_commands.describe(role="Role granted full Griffin mod access — omit to clear it")
+    async def manager_role(self, interaction: discord.Interaction, role: discord.Role = None):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "❌ Only someone with Manage Server can change Griffin's manager role.", ephemeral=True
+            )
+            return
+        await self.db.set_griffin_manager_role(interaction.guild.id, role.id if role else None)
+        if role:
+            await interaction.response.send_message(
+                f"✅ {role.mention} can now use every Griffin mod command — no Manage Server needed. "
+                f"(This can be the same role as the race librarian, or a different one.)"
+            )
+        else:
+            await interaction.response.send_message("✅ Griffin manager role cleared.")
 
     @app_commands.command(name="help", description="Show what Griffin's mod commands can do.")
     async def help(self, interaction: discord.Interaction):
@@ -549,6 +580,8 @@ class ModGroup(app_commands.Group):
             title="🛠️ Mod Commands",
             color=discord.Color.orange(),
             description="\n".join([
+                "**/mod manager-role** `<role>` — Set who can use every Griffin mod command "
+                "without Manage Server (Manage Server required to run this one)",
                 "**/gg add member** `<member> <amount>` — Give Goblin Gold to a member",
                 "**/gg add library-card** `<name> <image> [accent_color]` — Add a new "
                 "library card design to the catalog",

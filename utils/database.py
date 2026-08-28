@@ -86,6 +86,7 @@ class Database:
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_channel_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_role_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_manager_role_id BIGINT;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS griffin_manager_role_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_timezone TEXT;")
 
         await self._execute("""
@@ -254,7 +255,7 @@ class Database:
         row = await self._fetchone(
             "SELECT message_rate, message_cooldown, voice_rate, voice_interval, "
             "levelup_channel_id, assets_channel_id, sprint_channel_id, sprint_role_id, "
-            "sprint_manager_role_id, sprint_timezone "
+            "sprint_manager_role_id, sprint_timezone, griffin_manager_role_id "
             "FROM guild_config WHERE guild_id = %s",
             guild_id
         )
@@ -271,6 +272,7 @@ class Database:
             "sprint_role_id": None,
             "sprint_manager_role_id": None,
             "sprint_timezone": None,
+            "griffin_manager_role_id": None,
         }
 
     async def set_levelup_channel(self, guild_id: int, channel_id: int):
@@ -311,6 +313,14 @@ class Database:
             VALUES (%s, %s)
             ON CONFLICT (guild_id)
             DO UPDATE SET sprint_manager_role_id = %s
+        """, guild_id, role_id, role_id)
+
+    async def set_griffin_manager_role(self, guild_id: int, role_id: int):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, griffin_manager_role_id)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET griffin_manager_role_id = %s
         """, guild_id, role_id, role_id)
 
     async def set_sprint_timezone(self, guild_id: int, tz_name: str):
