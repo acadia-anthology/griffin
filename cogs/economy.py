@@ -355,7 +355,7 @@ class AddGroup(GriffinModGroup):
         await self.db.add_library_card(interaction.guild.id, name, image_url, interaction.user.id, stored_color)
         note = "" if archived else (
             "\n⚠️ No assets channel set, so this uses the original upload link, which may not stay "
-            "valid long-term. Set one with `/gg channelset assets`."
+            "valid long-term. Set one with `/staff channelset assets`."
         )
         await interaction.followup.send(f"✅ Added library card **{name}** to the catalog.{note}")
 
@@ -547,18 +547,18 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-class ModGroup(GriffinModGroup):
+class StaffGroup(GriffinModGroup):
     def __init__(self, db):
-        super().__init__(name="mod", description="Mod-only tools")
+        super().__init__(name="staff", description="Staff-only tools")
         self.db = db
         self.add_command(ChannelSetGroup(db))
         self.add_command(RaceConfigGroup(db))
 
     @app_commands.command(
         name="manager-role",
-        description="Set (or clear) the role that can use all of Griffin's mod commands without Manage Server."
+        description="Set (or clear) the role that can use all of Griffin's staff commands without Manage Server."
     )
-    @app_commands.describe(role="Role granted full Griffin mod access — omit to clear it")
+    @app_commands.describe(role="Role granted full Griffin staff access — omit to clear it")
     async def manager_role(self, interaction: discord.Interaction, role: discord.Role = None):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message(
@@ -568,19 +568,19 @@ class ModGroup(GriffinModGroup):
         await self.db.set_griffin_manager_role(interaction.guild.id, role.id if role else None)
         if role:
             await interaction.response.send_message(
-                f"✅ {role.mention} can now use every Griffin mod command — no Manage Server needed. "
+                f"✅ {role.mention} can now use every Griffin staff command — no Manage Server needed. "
                 f"(This can be the same role as the race librarian, or a different one.)"
             )
         else:
             await interaction.response.send_message("✅ Griffin manager role cleared.")
 
-    @app_commands.command(name="help", description="Show what Griffin's mod commands can do.")
+    @app_commands.command(name="help", description="Show what Griffin's staff commands can do.")
     async def help(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title="🛠️ Mod Commands",
+            title="🛠️ Staff Commands",
             color=discord.Color.orange(),
             description="\n".join([
-                "**/mod manager-role** `<role>` — Set who can use every Griffin mod command "
+                "**/staff manager-role** `<role>` — Set who can use every Griffin staff command "
                 "without Manage Server (Manage Server required to run this one)",
                 "**/gg add member** `<member> <amount>` — Give Goblin Gold to a member",
                 "**/gg add library-card** `<name> <image> [accent_color]` — Add a new "
@@ -590,15 +590,15 @@ class ModGroup(GriffinModGroup):
                 "and its cooldown",
                 "**/gg setrate voice** `<amount> <per>` — Set GG earned per interval in "
                 "voice, prorated while connected",
-                "**/mod channelset levelup** `<channel>` — Set the channel for level-up "
+                "**/staff channelset levelup** `<channel>` — Set the channel for level-up "
                 "announcements",
-                "**/mod channelset assets** `<channel>` — Set the channel uploaded card art "
+                "**/staff channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
-                "**/mod channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
-                "**/mod race ping-role** `<role>` — Set the role pinged when a sprint starts",
-                "**/mod race librarian-role** `<role>` — Set who can manage sprints and gets "
+                "**/staff channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
+                "**/staff race ping-role** `<role>` — Set the role pinged when a sprint starts",
+                "**/staff race librarian-role** `<role>` — Set who can manage sprints and gets "
                 "pinged with results",
-                "**/mod race timezone** `<timezone>` — Set the timezone for scheduled sprint times",
+                "**/staff race timezone** `<timezone>` — Set the timezone for scheduled sprint times",
             ])
         )
         await interaction.response.send_message(embed=embed)
@@ -609,4 +609,4 @@ async def setup(bot: commands.Bot):
     bot.tree.add_command(PatronGroup(bot.db))
     bot.tree.add_command(GGGroup(bot.db))
     bot.tree.add_command(help_command)
-    bot.tree.add_command(ModGroup(bot.db))
+    bot.tree.add_command(StaffGroup(bot.db))
