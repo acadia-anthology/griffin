@@ -13,6 +13,8 @@ intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
+ONLINE_CHANNEL_ID = 1542950080716476449
+
 
 class Griffin(commands.Bot):
     def __init__(self):
@@ -23,6 +25,7 @@ class Griffin(commands.Bot):
         )
         self.db = Database()
         self.app_emojis = {}
+        self._online_announced = False
         self.tree.on_error = self.on_app_command_error
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
@@ -59,6 +62,15 @@ class Griffin(commands.Bot):
         await self.change_presence(
             activity=discord.CustomActivity(name="Griffin is causing chaos...")
         )
+        # on_ready can fire again on reconnects — only announce once per process.
+        if not self._online_announced:
+            self._online_announced = True
+            channel = self.get_channel(ONLINE_CHANNEL_ID)
+            if channel:
+                try:
+                    await channel.send("🧌 Griffin is back online and ready to cause chaos!")
+                except discord.HTTPException:
+                    pass
 
 
 bot = Griffin()
