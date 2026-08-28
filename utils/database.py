@@ -85,6 +85,8 @@ class Database:
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS assets_channel_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_channel_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_role_id BIGINT;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_manager_role_id BIGINT;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_timezone TEXT;")
 
         await self._execute("""
             CREATE TABLE IF NOT EXISTS sprints (
@@ -131,9 +133,13 @@ class Database:
                 start_val TEXT,
                 end_val TEXT,
                 joined_at TIMESTAMP,
+                active_seconds INTEGER DEFAULT 0,
+                resumed_at TIMESTAMP,
+                segments TEXT,
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
+        await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS segments TEXT;")
         await self._execute("""
             CREATE TABLE IF NOT EXISTS sprint_book_meta (
                 user_id BIGINT NOT NULL,
@@ -247,7 +253,8 @@ class Database:
     async def get_guild_config(self, guild_id: int) -> dict:
         row = await self._fetchone(
             "SELECT message_rate, message_cooldown, voice_rate, voice_interval, "
-            "levelup_channel_id, assets_channel_id, sprint_channel_id, sprint_role_id "
+            "levelup_channel_id, assets_channel_id, sprint_channel_id, sprint_role_id, "
+            "sprint_manager_role_id, sprint_timezone "
             "FROM guild_config WHERE guild_id = %s",
             guild_id
         )
@@ -262,6 +269,8 @@ class Database:
             "assets_channel_id": None,
             "sprint_channel_id": None,
             "sprint_role_id": None,
+            "sprint_manager_role_id": None,
+            "sprint_timezone": None,
         }
 
     async def set_levelup_channel(self, guild_id: int, channel_id: int):
@@ -295,6 +304,22 @@ class Database:
             ON CONFLICT (guild_id)
             DO UPDATE SET sprint_role_id = %s
         """, guild_id, role_id, role_id)
+
+    async def set_sprint_manager_role(self, guild_id: int, role_id: int):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, sprint_manager_role_id)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET sprint_manager_role_id = %s
+        """, guild_id, role_id, role_id)
+
+    async def set_sprint_timezone(self, guild_id: int, tz_name: str):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, sprint_timezone)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET sprint_timezone = %s
+        """, guild_id, tz_name, tz_name)
 
     async def set_message_rate(self, guild_id: int, amount: int, cooldown: int):
         await self._execute("""
@@ -448,20 +473,49 @@ class Database:
         await self._execute("DELETE FROM active_sprint_participants WHERE guild_id=%s", guild_id)
 
     async def save_sprint_participant(self, guild_id, user_id, ptype, title, start_val, end_val=None, joined_at=None):
+        """Starts (or restarts, e.g. after switching books) a fresh active-time clock."""
         from datetime import datetime
         joined_at = joined_at or datetime.utcnow()
         await self._execute("""
-            INSERT INTO active_sprint_participants (guild_id, user_id, type, title, start_val, end_val, joined_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (guild_id, user_id) DO UPDATE SET type=%s, title=%s, start_val=%s, end_val=%s, joined_at=COALESCE(active_sprint_participants.joined_at, %s)
-        """, guild_id, user_id, ptype, title, start_val, end_val, joined_at,
-             ptype, title, start_val, end_val, joined_at)
+            INSERT INTO active_sprint_participants
+                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                type=%s, title=%s, start_val=%s, end_val=%s,
+                joined_at=COALESCE(active_sprint_participants.joined_at, %s),
+                active_seconds=0, resumed_at=%s
+        """, guild_id, user_id, ptype, title, start_val, end_val, joined_at, joined_at,
+             ptype, title, start_val, end_val, joined_at, joined_at)
 
     async def update_sprint_participant_end(self, guild_id, user_id, end_val):
         await self._execute(
             "UPDATE active_sprint_participants SET end_val=%s WHERE guild_id=%s AND user_id=%s",
             end_val, guild_id, user_id
         )
+
+    async def update_sprint_participant_segments(self, guild_id, user_id, segments_json: str):
+        """Persists completed Switch Books legs so they survive a bot restart mid-sprint."""
+        await self._execute(
+            "UPDATE active_sprint_participants SET segments=%s WHERE guild_id=%s AND user_id=%s",
+            segments_json, guild_id, user_id
+        )
+
+    async def leave_sprint_participant(self, guild_id, user_id):
+        """Banks elapsed active time and pauses the clock."""
+        await self._execute("""
+            UPDATE active_sprint_participants
+            SET active_seconds = active_seconds + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - resumed_at))::INTEGER),
+                resumed_at = NULL
+            WHERE guild_id=%s AND user_id=%s AND resumed_at IS NOT NULL
+        """, guild_id, user_id)
+
+    async def resume_sprint_participant(self, guild_id, user_id):
+        """Resumes a paused clock without touching progress/title."""
+        await self._execute("""
+            UPDATE active_sprint_participants
+            SET resumed_at = NOW()
+            WHERE guild_id=%s AND user_id=%s AND resumed_at IS NULL
+        """, guild_id, user_id)
 
     async def get_sprint_participants(self, guild_id) -> list:
         return await self._fetchall("SELECT * FROM active_sprint_participants WHERE guild_id=%s", guild_id)

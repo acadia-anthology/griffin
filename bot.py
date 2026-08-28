@@ -4,6 +4,7 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from utils.database import Database
+from utils.emojis import load_application_emojis
 
 load_dotenv()
 
@@ -21,6 +22,7 @@ class Griffin(commands.Bot):
             help_command=None
         )
         self.db = Database()
+        self.app_emojis = {}
         self.tree.on_error = self.on_app_command_error
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
@@ -39,6 +41,8 @@ class Griffin(commands.Bot):
 
     async def setup_hook(self):
         await self.db.initialize()
+        self.app_emojis = await load_application_emojis(self)
+        print(f"✅ Loaded {len(self.app_emojis)} application emojis")
         cogs = [
             "cogs.core",
             "cogs.economy",

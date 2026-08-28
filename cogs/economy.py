@@ -1,6 +1,7 @@
 import io
 import time
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
@@ -402,16 +403,47 @@ class ChannelSetGroup(app_commands.Group):
         await interaction.response.send_message(f"✅ Sprints can now only be started in {channel.mention}.")
 
 
-class SetRoleGroup(app_commands.Group):
+class RaceConfigGroup(app_commands.Group):
     def __init__(self, db):
-        super().__init__(name="setrole", description="Configure roles Griffin pings")
+        super().__init__(name="race", description="Configure sprint/race settings")
         self.db = db
 
-    @app_commands.command(name="sprint", description="Set the role pinged when a sprint starts.")
-    @app_commands.describe(role="Role to ping for sprints")
-    async def sprint(self, interaction: discord.Interaction, role: discord.Role):
+    @app_commands.command(name="ping-role", description="Set the role pinged when a sprint/race starts.")
+    @app_commands.describe(role="Role to ping for sprints (e.g. Page Racers)")
+    async def ping_role(self, interaction: discord.Interaction, role: discord.Role):
         await self.db.set_sprint_role(interaction.guild.id, role.id)
         await interaction.response.send_message(f"✅ Sprints will now ping {role.mention}.")
+
+    @app_commands.command(
+        name="librarian-role",
+        description="Set who can manage sprints and gets pinged with results."
+    )
+    @app_commands.describe(role="Role that can create/manage sprints and receives leaderboard pings")
+    async def librarian_role(self, interaction: discord.Interaction, role: discord.Role):
+        await self.db.set_sprint_manager_role(interaction.guild.id, role.id)
+        await interaction.response.send_message(
+            f"✅ {role.mention} can now manage sprints and will be pinged with results."
+        )
+
+    @app_commands.command(
+        name="timezone",
+        description="Set the timezone used to interpret scheduled sprint start times."
+    )
+    @app_commands.describe(timezone="IANA timezone name, e.g. America/New_York or Europe/London")
+    async def timezone(self, interaction: discord.Interaction, timezone: str):
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError:
+            await interaction.response.send_message(
+                f"❌ `{timezone}` isn't a recognized timezone. Use an IANA name like "
+                f"`America/New_York` or `Europe/London`.",
+                ephemeral=True
+            )
+            return
+        await self.db.set_sprint_timezone(interaction.guild.id, timezone)
+        await interaction.response.send_message(
+            f"✅ Scheduled sprint times will be interpreted as **{timezone}**."
+        )
 
 
 class GGGroup(app_commands.Group):
@@ -509,7 +541,7 @@ class ModGroup(app_commands.Group):
         )
         self.db = db
         self.add_command(ChannelSetGroup(db))
-        self.add_command(SetRoleGroup(db))
+        self.add_command(RaceConfigGroup(db))
 
     @app_commands.command(name="help", description="Show what Griffin's mod commands can do.")
     async def help(self, interaction: discord.Interaction):
@@ -530,7 +562,10 @@ class ModGroup(app_commands.Group):
                 "**/mod channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
                 "**/mod channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
-                "**/mod setrole sprint** `<role>` — Set the role pinged when a sprint starts",
+                "**/mod race ping-role** `<role>` — Set the role pinged when a sprint starts",
+                "**/mod race librarian-role** `<role>` — Set who can manage sprints and gets "
+                "pinged with results",
+                "**/mod race timezone** `<timezone>` — Set the timezone for scheduled sprint times",
             ])
         )
         await interaction.response.send_message(embed=embed)
