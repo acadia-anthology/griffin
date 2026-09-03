@@ -53,6 +53,15 @@ def _safe_name(member: discord.Member | None, user_id: int) -> str:
     return member.display_name if member else f"User {user_id}"
 
 
+def _lookup_participant_type(cog, guild_id: int, uid: int) -> str | None:
+    """In-memory lookup of a participant's tracking type — checks the active
+    sprint, then (during the post-sprint log window) the finishing sprint."""
+    sprint = active_sprints.get(guild_id) or cog._logging_sprints.get(guild_id)
+    if sprint and uid in sprint["participants"]:
+        return sprint["participants"][uid]["type"]
+    return None
+
+
 async def _get_channel(guild, channel_id):
     ch = guild.get_channel(channel_id) or guild.get_thread(channel_id)
     if ch is None:
@@ -621,36 +630,48 @@ class JoinSprintView(discord.ui.View):
                 view=ResumeOrFreshView(self.cog), ephemeral=True
             )
             return
+        if existing:
+            await interaction.response.send_message(
+                "❌ You're already in this sprint — use **Update Progress** or **Switch Books** instead.",
+                ephemeral=True
+            )
+            return
         await interaction.response.send_message(
             "How would you like to track your sprint?", view=JoinTypeView(self.cog), ephemeral=True
         )
 
     @discord.ui.button(label="🔄 Update Progress", style=discord.ButtonStyle.success, custom_id="sprint_update_btn", row=0)
     async def update_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = await interaction.client.db._fetchone(
-            "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
-            interaction.guild.id, interaction.user.id
-        )
-        if not row:
+        ptype = _lookup_participant_type(self.cog, interaction.guild.id, interaction.user.id)
+        if not ptype:
+            row = await interaction.client.db._fetchone(
+                "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
+                interaction.guild.id, interaction.user.id
+            )
+            ptype = row["type"] if row else None
+        if not ptype:
             await interaction.response.send_message(
                 "❌ You haven't joined this sprint yet — pick a join type first!", ephemeral=True
             )
             return
-        modal_cls = UpdatePagesModal if row["type"] == "pages" else UpdateAudioPctModal
+        modal_cls = UpdatePagesModal if ptype == "pages" else UpdateAudioPctModal
         await interaction.response.send_modal(modal_cls(self.cog))
 
     @discord.ui.button(label="📚 Switch Books", style=discord.ButtonStyle.success, custom_id="sprint_switch_btn", row=1)
     async def switch_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = await interaction.client.db._fetchone(
-            "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
-            interaction.guild.id, interaction.user.id
-        )
-        if not row:
+        ptype = _lookup_participant_type(self.cog, interaction.guild.id, interaction.user.id)
+        if not ptype:
+            row = await interaction.client.db._fetchone(
+                "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
+                interaction.guild.id, interaction.user.id
+            )
+            ptype = row["type"] if row else None
+        if not ptype:
             await interaction.response.send_message(
                 "❌ You haven't joined this sprint yet.", ephemeral=True
             )
             return
-        await interaction.response.send_modal(SwitchBookOldModal(self.cog, row["type"]))
+        await interaction.response.send_modal(SwitchBookOldModal(self.cog, ptype))
 
     @discord.ui.button(label="🚪 Leave Sprint", style=discord.ButtonStyle.danger, custom_id="sprint_leave_btn", row=1)
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -678,16 +699,19 @@ class LogProgressView(discord.ui.View):
 
     @discord.ui.button(label="📝 Log Sprint", style=discord.ButtonStyle.success, custom_id="sprint_log_btn", row=0)
     async def log_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = await interaction.client.db._fetchone(
-            "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
-            interaction.guild.id, interaction.user.id
-        )
-        if not row:
+        ptype = _lookup_participant_type(self.cog, interaction.guild.id, interaction.user.id)
+        if not ptype:
+            row = await interaction.client.db._fetchone(
+                "SELECT type FROM active_sprint_participants WHERE guild_id=%s AND user_id=%s",
+                interaction.guild.id, interaction.user.id
+            )
+            ptype = row["type"] if row else None
+        if not ptype:
             await interaction.response.send_message(
                 "❌ You don't have a sprint entry to log — you may not have joined this sprint.", ephemeral=True
             )
             return
-        modal_cls = LogPagesModal if row["type"] == "pages" else LogAudioPctModal
+        modal_cls = LogPagesModal if ptype == "pages" else LogAudioPctModal
         await interaction.response.send_modal(modal_cls(self.cog))
 
 
