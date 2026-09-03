@@ -4,6 +4,7 @@ from discord import app_commands
 from datetime import timezone, timedelta, datetime
 import asyncio
 import json
+import traceback
 
 from cogs.economy import _award_gg
 from utils.emojis import emoji as _emoji
@@ -124,9 +125,51 @@ def _combined_title_and_pages(data: dict, end_val) -> tuple[str | None, int]:
     return title, total_pages
 
 
+class SafeView(discord.ui.View):
+    """Base for every sprint view — without this, a failed button callback
+    leaves the interaction unresponded and Discord just shows "didn't
+    respond in time" with zero information about what actually broke."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        print(f"View error on {item!r}:")
+        traceback.print_exc()
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Something went wrong — please try again.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Something went wrong — please try again.", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass
+
+
+class SafeModal(discord.ui.Modal):
+    """Base for every sprint modal — without this, a failed on_submit leaves
+    the interaction unresponded and Discord just shows "didn't respond in
+    time" with zero information about what actually broke."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        print(f"Modal error in {self.title!r}:")
+        traceback.print_exc()
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Something went wrong submitting that — please try again.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Something went wrong submitting that — please try again.", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass
+
+
 # ── Pagination ───────────────────────────────────────────────────────────────
 
-class EmbedPaginatorView(discord.ui.View):
+class EmbedPaginatorView(SafeView):
     def __init__(self, embeds: list[discord.Embed], *, timeout=180):
         super().__init__(timeout=timeout)
         self.embeds = embeds
@@ -176,7 +219,7 @@ def _paginate_lines(lines: list[str], title: str, per_page: int = 10, char_limit
 
 # ── Modals ────────────────────────────────────────────────────────────────────
 
-class JoinPagesModal(discord.ui.Modal, title="Join Sprint — Pages"):
+class JoinPagesModal(SafeModal, title="Join Sprint — Pages"):
     reading = discord.ui.TextInput(label="Reading title", placeholder="What are you reading?", required=False)
     start_page = discord.ui.TextInput(label="Starting page", placeholder="e.g. 42", default="0")
 
@@ -213,7 +256,7 @@ class JoinPagesModal(discord.ui.Modal, title="Join Sprint — Pages"):
         await self.cog._update_join_embed(interaction.guild)
 
 
-class JoinAudioPctModal(discord.ui.Modal, title="Join Sprint — Audio %"):
+class JoinAudioPctModal(SafeModal, title="Join Sprint — Audio %"):
     listening = discord.ui.TextInput(label="Listening to", placeholder="What are you listening to?")
     total_hours = discord.ui.TextInput(label="Total audiobook length (hh:mm or hours)", placeholder="e.g. 12 or 12:30")
     start_pct = discord.ui.TextInput(label="Starting percentage", placeholder="e.g. 24")
@@ -275,7 +318,7 @@ class JoinAudioPctModal(discord.ui.Modal, title="Join Sprint — Audio %"):
         await self.cog._update_join_embed(interaction.guild)
 
 
-class UpdatePagesModal(discord.ui.Modal, title="Update Progress — Pages"):
+class UpdatePagesModal(SafeModal, title="Update Progress — Pages"):
     current_page = discord.ui.TextInput(label="Current page", placeholder="e.g. 87")
 
     def __init__(self, cog):
@@ -309,7 +352,7 @@ class UpdatePagesModal(discord.ui.Modal, title="Update Progress — Pages"):
         )
 
 
-class UpdateAudioPctModal(discord.ui.Modal, title="Update Progress — Audio %"):
+class UpdateAudioPctModal(SafeModal, title="Update Progress — Audio %"):
     current_pct = discord.ui.TextInput(label="Current percentage", placeholder="e.g. 38")
 
     def __init__(self, cog):
@@ -344,7 +387,7 @@ class UpdateAudioPctModal(discord.ui.Modal, title="Update Progress — Audio %")
         )
 
 
-class LogPagesModal(discord.ui.Modal, title="Log Sprint — Pages"):
+class LogPagesModal(SafeModal, title="Log Sprint — Pages"):
     end_page = discord.ui.TextInput(label="Final page", placeholder="e.g. 87")
 
     def __init__(self, cog):
@@ -381,7 +424,7 @@ class LogPagesModal(discord.ui.Modal, title="Log Sprint — Pages"):
         await self.cog._update_end_embed(interaction.guild)
 
 
-class LogAudioPctModal(discord.ui.Modal, title="Log Sprint — Audio %"):
+class LogAudioPctModal(SafeModal, title="Log Sprint — Audio %"):
     end_pct = discord.ui.TextInput(label="Final percentage", placeholder="e.g. 52")
 
     def __init__(self, cog):
@@ -420,7 +463,7 @@ class LogAudioPctModal(discord.ui.Modal, title="Log Sprint — Audio %"):
 
 # ── Switch Books ─────────────────────────────────────────────────────────────
 
-class SwitchBookOldModal(discord.ui.Modal):
+class SwitchBookOldModal(SafeModal):
     def __init__(self, cog, ptype: str):
         super().__init__(title="Switch Books — Current Book's Progress")
         self.cog = cog
@@ -458,7 +501,7 @@ class SwitchBookOldModal(discord.ui.Modal):
         )
 
 
-class SwitchBookContinueView(discord.ui.View):
+class SwitchBookContinueView(SafeView):
     def __init__(self, cog, ptype: str):
         super().__init__(timeout=300)
         self.cog = cog
@@ -475,7 +518,7 @@ class SwitchBookContinueView(discord.ui.View):
             pass
 
 
-class SwitchBookNewModal(discord.ui.Modal):
+class SwitchBookNewModal(SafeModal):
     def __init__(self, cog, ptype: str):
         super().__init__(title="Switch Books — New Book")
         self.cog = cog
@@ -531,7 +574,7 @@ class SwitchBookNewModal(discord.ui.Modal):
 
 # ── Views ─────────────────────────────────────────────────────────────────────
 
-class BookSelectView(discord.ui.View):
+class BookSelectView(SafeView):
     def __init__(self, cog, titles: list[str], modal_type: str):
         super().__init__(timeout=60)
         self.cog = cog
@@ -562,7 +605,7 @@ class BookSelectView(discord.ui.View):
         return callback
 
 
-class JoinTypeView(discord.ui.View):
+class JoinTypeView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=120)
         self.cog = cog
@@ -585,7 +628,7 @@ class JoinTypeView(discord.ui.View):
             await interaction.response.send_modal(modal_cls(self.cog))
 
 
-class ResumeOrFreshView(discord.ui.View):
+class ResumeOrFreshView(SafeView):
     """Shown when a paused (left) entry already exists for this participant."""
     def __init__(self, cog):
         super().__init__(timeout=60)
@@ -614,7 +657,7 @@ class ResumeOrFreshView(discord.ui.View):
         )
 
 
-class JoinSprintView(discord.ui.View):
+class JoinSprintView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
@@ -692,7 +735,7 @@ class JoinSprintView(discord.ui.View):
         await self.cog._update_join_embed(interaction.guild)
 
 
-class LogProgressView(discord.ui.View):
+class LogProgressView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
@@ -853,7 +896,8 @@ class Sprints(commands.Cog):
             embeds = self._build_sprint_embeds(guild, start_time, end_time, host_name, sprint["duration"])
             await msg.edit(embeds=embeds)
         except Exception:
-            pass
+            print(f"_update_join_embed failed for guild {guild.id}:")
+            traceback.print_exc()
 
     # ── End-of-sprint checklist ───────────────────────────────────────────────
 
@@ -899,7 +943,8 @@ class Sprints(commands.Cog):
             msg = await channel.fetch_message(message_id)
             await msg.edit(embed=self._build_end_embed(guild.id, deadline))
         except Exception:
-            pass
+            print(f"_update_end_embed failed for guild {guild.id}:")
+            traceback.print_exc()
 
     # ── /race start ───────────────────────────────────────────────────────────
 
@@ -1004,6 +1049,47 @@ class Sprints(commands.Cog):
 
         await asyncio.sleep(duration_minutes * 60)
         await self._finish_sprint(interaction.guild)
+
+    # ── /race cancel ──────────────────────────────────────────────────────────
+
+    @race.command(name="cancel", description="Force-cancel the current sprint (running or awaiting logs).")
+    async def sprint_cancel(self, interaction: discord.Interaction):
+        guild_id = interaction.guild.id
+        settings = await self.bot.db.get_guild_config(guild_id)
+        manager_role_id = settings.get("sprint_manager_role_id")
+        griffin_manager_role_id = settings.get("griffin_manager_role_id")
+        if manager_role_id or griffin_manager_role_id:
+            user_role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
+            has_role = manager_role_id in user_role_ids or griffin_manager_role_id in user_role_ids
+            if not has_role and not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message(
+                    "❌ You don't have permission to cancel sprints.", ephemeral=True
+                )
+                return
+
+        cancelled_something = False
+
+        if guild_id in active_sprints:
+            active_sprints.pop(guild_id, None)
+            cancelled_something = True
+
+        if guild_id in self._logging_sprints:
+            self._logging_sprints.pop(guild_id, None)
+            self._end_message.pop(guild_id, None)
+            task = self._logging_tasks.pop(guild_id, None)
+            if task and not task.done():
+                task.cancel()
+            cancelled_something = True
+
+        await self.bot.db.delete_active_sprint(guild_id)
+
+        if cancelled_something:
+            await interaction.response.send_message("🛑 The current sprint has been cancelled.")
+        else:
+            await interaction.response.send_message(
+                "There's no sprint running right now, but I cleared any leftover state just in case.",
+                ephemeral=True
+            )
 
     # ── /race edit ────────────────────────────────────────────────────────────
 
@@ -1206,7 +1292,7 @@ class Sprints(commands.Cog):
 
 # ── Sprint Edit Views ─────────────────────────────────────────────────────────
 
-class SprintEditModal(discord.ui.Modal):
+class SprintEditModal(SafeModal):
     def __init__(self, bot, sprint_id: int, title: str, start: int, end: int, log_type: str, guild_id: int):
         super().__init__(title="Edit Sprint Log")
         self.bot = bot
@@ -1238,7 +1324,7 @@ class SprintEditModal(discord.ui.Modal):
         )
 
 
-class SprintDeleteConfirmView(discord.ui.View):
+class SprintDeleteConfirmView(SafeView):
     def __init__(self, bot, sprint_id: int, guild_id: int):
         super().__init__(timeout=30)
         self.bot = bot
@@ -1262,7 +1348,7 @@ class SprintDeleteConfirmView(discord.ui.View):
         self.stop()
 
 
-class SprintLogSelectView(discord.ui.View):
+class SprintLogSelectView(SafeView):
     def __init__(self, bot, logs: list, guild_id: int):
         super().__init__(timeout=60)
         self.bot = bot
