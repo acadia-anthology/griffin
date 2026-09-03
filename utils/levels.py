@@ -29,33 +29,47 @@ TIER_NAMES = [
 ]
 
 
-def cumulative_for_level(level: int) -> int:
+TIER_LO_LEVELS = [lo for lo, _hi, _name in TIER_NAMES]
+
+
+def cumulative_for_level(level: int, thresholds: dict = None, flat_rate: int = None) -> int:
+    thresholds = thresholds or LEVEL_THRESHOLDS
+    flat_rate = flat_rate or FLAT_RATE
     level = max(0, min(level, MAX_LEVEL))
     if level <= FLAT_START_LEVEL:
-        return LEVEL_THRESHOLDS[level]
-    return LEVEL_THRESHOLDS[FLAT_START_LEVEL] + (level - FLAT_START_LEVEL) * FLAT_RATE
+        return thresholds[level]
+    return thresholds[FLAT_START_LEVEL] + (level - FLAT_START_LEVEL) * flat_rate
 
 
-def get_level(total_gg: int) -> int:
-    if total_gg >= cumulative_for_level(MAX_LEVEL):
+def get_level(total_gg: int, thresholds: dict = None, flat_rate: int = None) -> int:
+    if total_gg >= cumulative_for_level(MAX_LEVEL, thresholds, flat_rate):
         return MAX_LEVEL
     level = 0
-    while cumulative_for_level(level + 1) <= total_gg:
+    while cumulative_for_level(level + 1, thresholds, flat_rate) <= total_gg:
         level += 1
     return level
 
 
-def get_progress(total_gg: int):
+def get_progress(total_gg: int, thresholds: dict = None, flat_rate: int = None):
     """Returns (level, gg_into_level, gg_needed_for_next_level). gg_needed is 0 at max level."""
-    level = get_level(total_gg)
+    level = get_level(total_gg, thresholds, flat_rate)
     if level >= MAX_LEVEL:
-        return level, total_gg - cumulative_for_level(MAX_LEVEL), 0
-    floor = cumulative_for_level(level)
-    ceiling = cumulative_for_level(level + 1)
+        return level, total_gg - cumulative_for_level(MAX_LEVEL, thresholds, flat_rate), 0
+    floor = cumulative_for_level(level, thresholds, flat_rate)
+    ceiling = cumulative_for_level(level + 1, thresholds, flat_rate)
     return level, total_gg - floor, ceiling - floor
 
 
+def get_tier_range(level: int) -> tuple:
+    """Returns the (lo, hi) level range of the tier containing this level."""
+    for lo, hi, _name in TIER_NAMES:
+        if lo <= level <= hi:
+            return lo, hi
+    return TIER_NAMES[0][0], TIER_NAMES[0][1]
+
+
 def get_tier_name(level: int) -> str:
+    """Default (unbranded) tier name — overridden per guild by a configured role's name."""
     for lo, hi, name in TIER_NAMES:
         if lo <= level <= hi:
             return name

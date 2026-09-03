@@ -196,7 +196,8 @@ def _gg_text(total_gg: int, gg_into_level: int, gg_needed: int) -> str:
 def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[int],
                       total_gg: int, gg_into_level: int, gg_needed: int,
                       background_bytes: Optional[bytes] = None,
-                      accent_color: Optional[tuple] = None) -> io.BytesIO:
+                      accent_color: Optional[tuple] = None,
+                      tier_name: Optional[str] = None) -> io.BytesIO:
     accent = accent_color or DEFAULT_ACCENT
     W, H = s(480), s(130)
     img = _base_canvas(W, H, RANK_BG, background_bytes)
@@ -208,7 +209,8 @@ def render_rank_card(name: str, avatar_bytes: bytes, level: int, rank: Optional[
 
     text_x = s(18)
     draw.text((text_x, s(12)), name, font=_font(True, s(20)), fill=accent)
-    draw.text((text_x, s(38)), f"LEVEL: {level}", font=_font(True, s(15)), fill=WHITE)
+    level_text = f"{tier_name.upper()} · LVL {level}" if tier_name else f"LEVEL: {level}"
+    draw.text((text_x, s(38)), level_text, font=_font(True, s(15)), fill=WHITE)
 
     ratio = (gg_into_level / gg_needed) if gg_needed else 1.0
     bar_right = W - avatar_size - s(36)
@@ -341,7 +343,8 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
                          books_checked_out: Optional[str] = None,
                          birthday: Optional[str] = None,
                          background_bytes: Optional[bytes] = None,
-                         accent_color: Optional[tuple] = None) -> io.BytesIO:
+                         accent_color: Optional[tuple] = None,
+                         tier_name: Optional[str] = None) -> io.BytesIO:
     """Taller than the rank/level-up cards and variable height — the bottom
     grows to fit the bio/genres text, so layout is computed twice: once on a
     throwaway canvas to measure total height, then for real once H is known."""
@@ -429,7 +432,8 @@ def render_library_card(name: str, avatar_bytes: bytes, level: int, rank: Option
     bar_box = (pad_x, cy, W - pad_x, cy + bar_h)
     draw.rounded_rectangle(bar_box, radius=bar_h // 2, fill=accent)
     rank_text = str(rank) if rank else "Unranked"
-    stat_text = f"LEVEL: {level}   |   RANK: {rank_text}   |   GG: {total_gg:,}"
+    level_label = f"{tier_name.upper()}: {level}" if tier_name else f"LEVEL: {level}"
+    stat_text = f"{level_label}   |   RANK: {rank_text}   |   GG: {total_gg:,}"
     stat_bbox = draw.textbbox((0, 0), stat_text, font=bar_font)
     stat_w = stat_bbox[2] - stat_bbox[0]
     stat_h = stat_bbox[3] - stat_bbox[1]

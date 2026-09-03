@@ -1,4 +1,5 @@
 import io
+import json
 import time
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -41,6 +42,30 @@ async def _get_card_visuals(db, guild_id: int, member_row: dict):
     return background_bytes, accent_color
 
 
+async def _get_curve(db, guild_id: int):
+    """Merges a guild's edited level-1-30 thresholds and flat rate (31+) with the defaults."""
+    config = await db.get_guild_config(guild_id)
+    thresholds = dict(levels.LEVEL_THRESHOLDS)
+    raw = config.get("level_thresholds")
+    if raw:
+        try:
+            thresholds.update({int(k): v for k, v in json.loads(raw).items()})
+        except (ValueError, TypeError):
+            pass
+    flat_rate = config.get("level_flat_rate") or levels.FLAT_RATE
+    return thresholds, flat_rate
+
+
+async def _get_tier_display(db, guild: discord.Guild, level: int) -> str:
+    """The tier's display name for this level — a configured role's live name if set,
+    else the built-in default tier name."""
+    lo, _hi = levels.get_tier_range(level)
+    tier_roles = await db.get_tier_roles(guild.id)
+    role_id = tier_roles.get(lo)
+    role = guild.get_role(role_id) if role_id else None
+    return role.name if role else levels.get_tier_name(level)
+
+
 async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, old_level: int, new_level: int):
     config = await db.get_guild_config(guild.id)
     channel_id = config.get("levelup_channel_id")
@@ -71,10 +96,11 @@ async def _announce_levelup(db, guild: discord.Guild, member: discord.Member, ol
 async def _award_gg(db, guild: discord.Guild, member: discord.Member, amount: int):
     if amount <= 0:
         return
+    thresholds, flat_rate = await _get_curve(db, guild.id)
     before = await db.get_member(guild.id, member.id)
-    old_level = levels.get_level(before["gg"])
+    old_level = levels.get_level(before["gg"], thresholds, flat_rate)
     new_total = await db.add_gg(guild.id, member.id, amount)
-    new_level = levels.get_level(new_total)
+    new_level = levels.get_level(new_total, thresholds, flat_rate)
     if new_level > old_level:
         await _announce_levelup(db, guild, member, old_level, new_level)
 
@@ -211,7 +237,9 @@ class LibraryCardGroup(app_commands.Group):
         await interaction.response.defer()
         stats = await self.db.get_member(interaction.guild.id, target.id)
         placement = await self.db.get_rank(interaction.guild.id, target.id)
-        level = levels.get_level(stats["gg"])
+        thresholds, flat_rate = await _get_curve(self.db, interaction.guild.id)
+        level = levels.get_level(stats["gg"], thresholds, flat_rate)
+        tier_name = await _get_tier_display(self.db, interaction.guild, level)
         display_name = cards.sanitize_name(target.display_name, target.name)
         avatar_bytes = await target.display_avatar.read()
         background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
@@ -220,7 +248,7 @@ class LibraryCardGroup(app_commands.Group):
             display_name, avatar_bytes, level, placement, stats["gg"], member_since,
             stats.get("bio"), stats.get("favorite_genres"), stats.get("books_checked_out"),
             birthday=None,  # not implemented yet — always hidden until that feature lands
-            background_bytes=background_bytes, accent_color=accent_color
+            background_bytes=background_bytes, accent_color=accent_color, tier_name=tier_name
         )
         await interaction.followup.send(file=discord.File(buf, filename="library-card.png"))
 
@@ -269,13 +297,15 @@ class PatronGroup(app_commands.Group):
         await interaction.response.defer()
         stats = await self.db.get_member(interaction.guild.id, target.id)
         placement = await self.db.get_rank(interaction.guild.id, target.id)
-        level, gg_into_level, gg_needed = levels.get_progress(stats["gg"])
+        thresholds, flat_rate = await _get_curve(self.db, interaction.guild.id)
+        level, gg_into_level, gg_needed = levels.get_progress(stats["gg"], thresholds, flat_rate)
+        tier_name = await _get_tier_display(self.db, interaction.guild, level)
         avatar_bytes = await target.display_avatar.read()
         display_name = cards.sanitize_name(target.display_name, target.name)
         background_bytes, accent_color = await _get_card_visuals(self.db, interaction.guild.id, stats)
         buf = cards.render_rank_card(
             display_name, avatar_bytes, level, placement,
-            stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color
+            stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color, tier_name=tier_name
         )
         view = None
         if TIP_URL:
@@ -398,6 +428,118 @@ class SetRateGroup(GriffinModGroup):
         )
 
 
+class LevelsEditModal(discord.ui.Modal, title="Edit Level Curve"):
+    level_input = discord.ui.TextInput(
+        label="Level to edit (1-30)", placeholder="e.g. 12", required=False
+    )
+    gg_input = discord.ui.TextInput(
+        label="GG required for that level", placeholder="e.g. 29000", required=False
+    )
+    flat_rate_input = discord.ui.TextInput(
+        label="New flat rate for levels 31-100", placeholder="e.g. 25000", required=False
+    )
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+
+    async def on_submit(self, interaction: discord.Interaction):
+        level_raw = self.level_input.value.strip()
+        gg_raw = self.gg_input.value.strip()
+        flat_raw = self.flat_rate_input.value.strip()
+
+        if bool(level_raw) != bool(gg_raw):
+            await interaction.response.send_message(
+                "❌ To set a level's threshold, fill in both the level *and* the GG required.",
+                ephemeral=True
+            )
+            return
+        if not level_raw and not flat_raw:
+            await interaction.response.send_message(
+                "❌ Nothing to update — fill in a level + GG, a flat rate, or both.", ephemeral=True
+            )
+            return
+
+        confirmations = []
+
+        if level_raw:
+            try:
+                level = int(level_raw)
+                gg_required = int(gg_raw)
+            except ValueError:
+                await interaction.response.send_message(
+                    "❌ Level and GG required must both be whole numbers.", ephemeral=True
+                )
+                return
+            if not 1 <= level <= 30:
+                await interaction.response.send_message(
+                    "❌ Level must be between 1 and 30.", ephemeral=True
+                )
+                return
+            await self.db.set_level_threshold(interaction.guild.id, level, gg_required)
+            confirmations.append(f"Level {level} now requires **{gg_required:,} GG**.")
+
+        if flat_raw:
+            try:
+                flat_rate = int(flat_raw)
+            except ValueError:
+                await interaction.response.send_message(
+                    "❌ Flat rate must be a whole number.", ephemeral=True
+                )
+                return
+            await self.db.set_level_flat_rate(interaction.guild.id, flat_rate)
+            confirmations.append(f"Levels 31-100 now cost **{flat_rate:,} GG** each.")
+
+        await interaction.response.send_message("✅ " + " ".join(confirmations))
+
+
+class LevelsGroup(GriffinModGroup):
+    def __init__(self, db):
+        super().__init__(name="levels", description="View and adjust Griffin's level/tier ladder")
+        self.db = db
+
+    @app_commands.command(name="view", description="Show the full level/tier ladder and GG requirements.")
+    async def view(self, interaction: discord.Interaction):
+        thresholds, flat_rate = await _get_curve(self.db, interaction.guild.id)
+        tier_roles = await self.db.get_tier_roles(interaction.guild.id)
+        lines = []
+        for lo, hi, default_name in levels.TIER_NAMES:
+            role_id = tier_roles.get(lo)
+            role = interaction.guild.get_role(role_id) if role_id else None
+            name = role.mention if role else default_name
+            gg_required = levels.cumulative_for_level(lo, thresholds, flat_rate)
+            range_text = f"{lo}+" if lo == levels.MAX_LEVEL else f"{lo}-{hi}"
+            lines.append(f"**{name}** (Lvl {range_text}) — {gg_required:,} GG")
+        embed = discord.Embed(
+            title="📈 Level & Tier Ladder", description="\n".join(lines), color=discord.Color.gold()
+        )
+        embed.set_footer(text=f"Flat rate after level {levels.FLAT_START_LEVEL}: {flat_rate:,} GG/level")
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(
+        name="edit",
+        description="Edit a level's GG threshold (1-30) and/or the flat rate for levels 31-100."
+    )
+    async def edit(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(LevelsEditModal(self.db))
+
+    @app_commands.command(name="set-tier", description="Set (or clear) the role tied to a tier.")
+    @app_commands.describe(tier="Which tier to edit", role="Role to represent this tier — omit to clear")
+    @app_commands.choices(tier=[
+        app_commands.Choice(name=f"{name} ({lo}-{hi})" if lo != 100 else f"{name} (100+)", value=lo)
+        for lo, hi, name in levels.TIER_NAMES
+    ])
+    async def set_tier(
+        self, interaction: discord.Interaction,
+        tier: app_commands.Choice[int], role: discord.Role = None
+    ):
+        await self.db.set_tier_role(interaction.guild.id, tier.value, role.id if role else None)
+        if role:
+            await interaction.response.send_message(f"✅ **{tier.name}** is now tied to {role.mention}.")
+        else:
+            await interaction.response.send_message(f"✅ **{tier.name}** cleared — back to the default name.")
+
+
 class ChannelSetGroup(GriffinModGroup):
     def __init__(self, db):
         super().__init__(name="channelset", description="Configure channels Griffin posts to")
@@ -471,6 +613,7 @@ class GGGroup(GriffinModGroup):
         self.db = db
         self.add_command(AddGroup(db))
         self.add_command(SetRateGroup(db))
+        self.add_command(LevelsGroup(db))
 
     @app_commands.command(name="remove", description="Remove Goblin Gold from a member.")
     @app_commands.describe(member="Who to remove GG from", amount="How much GG to remove")
@@ -590,6 +733,10 @@ class StaffGroup(GriffinModGroup):
                 "and its cooldown",
                 "**/gg setrate voice** `<amount> <per>` — Set GG earned per interval in "
                 "voice, prorated while connected",
+                "**/gg levels view** — Show the full level/tier ladder and GG requirements",
+                "**/gg levels edit** — Modal to set a level's GG threshold (1-30) and/or the "
+                "flat rate for levels 31-100",
+                "**/gg levels set-tier** `<tier> [role]` — Tie a tier to a role (omit role to clear)",
                 "**/staff channelset levelup** `<channel>` — Set the channel for level-up "
                 "announcements",
                 "**/staff channelset assets** `<channel>` — Set the channel uploaded card art "

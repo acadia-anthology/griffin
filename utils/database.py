@@ -1,4 +1,5 @@
 import aiopg
+import json
 import os
 from typing import Optional
 
@@ -87,6 +88,17 @@ class Database:
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_role_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_manager_role_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS griffin_manager_role_id BIGINT;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS level_thresholds TEXT;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS level_flat_rate INTEGER;")
+
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS level_tier_roles (
+                guild_id BIGINT NOT NULL,
+                lo_level INTEGER NOT NULL,
+                role_id BIGINT,
+                PRIMARY KEY (guild_id, lo_level)
+            )
+        """)
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_timezone TEXT;")
 
         await self._execute("""
@@ -255,7 +267,8 @@ class Database:
         row = await self._fetchone(
             "SELECT message_rate, message_cooldown, voice_rate, voice_interval, "
             "levelup_channel_id, assets_channel_id, sprint_channel_id, sprint_role_id, "
-            "sprint_manager_role_id, sprint_timezone, griffin_manager_role_id "
+            "sprint_manager_role_id, sprint_timezone, griffin_manager_role_id, "
+            "level_thresholds, level_flat_rate "
             "FROM guild_config WHERE guild_id = %s",
             guild_id
         )
@@ -273,6 +286,8 @@ class Database:
             "sprint_manager_role_id": None,
             "sprint_timezone": None,
             "griffin_manager_role_id": None,
+            "level_thresholds": None,
+            "level_flat_rate": None,
         }
 
     async def set_levelup_channel(self, guild_id: int, channel_id: int):
@@ -322,6 +337,44 @@ class Database:
             ON CONFLICT (guild_id)
             DO UPDATE SET griffin_manager_role_id = %s
         """, guild_id, role_id, role_id)
+
+    # --- level curve (levels 1-30 individually editable, flat rate for 31+) ---
+
+    async def set_level_threshold(self, guild_id: int, level: int, gg_required: int):
+        config = await self.get_guild_config(guild_id)
+        raw = config.get("level_thresholds")
+        thresholds = json.loads(raw) if raw else {}
+        thresholds[str(level)] = gg_required
+        payload = json.dumps(thresholds)
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, level_thresholds)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET level_thresholds = %s
+        """, guild_id, payload, payload)
+
+    async def set_level_flat_rate(self, guild_id: int, rate: int):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, level_flat_rate)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET level_flat_rate = %s
+        """, guild_id, rate, rate)
+
+    # --- level tier -> role mapping (per guild, falls back to default names) ---
+
+    async def set_tier_role(self, guild_id: int, lo_level: int, role_id: Optional[int]):
+        await self._execute("""
+            INSERT INTO level_tier_roles (guild_id, lo_level, role_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (guild_id, lo_level) DO UPDATE SET role_id = %s
+        """, guild_id, lo_level, role_id, role_id)
+
+    async def get_tier_roles(self, guild_id: int) -> dict:
+        rows = await self._fetchall(
+            "SELECT lo_level, role_id FROM level_tier_roles WHERE guild_id=%s", guild_id
+        )
+        return {r["lo_level"]: r["role_id"] for r in rows if r["role_id"]}
 
     async def set_sprint_timezone(self, guild_id: int, tz_name: str):
         await self._execute("""
