@@ -244,11 +244,17 @@ class JoinPagesModal(SafeModal, title="Join Sprint — Pages"):
         title = self.reading.value or None
         uid = interaction.user.id
         joined_at = datetime.utcnow()
-        active_sprints[guild_id]["participants"][uid] = {
+        # Persist before touching memory: if the save fails, nothing is left behind, so the
+        # user can simply retry instead of being stuck as "already joined" with no roster entry.
+        await interaction.client.db.save_sprint_participant(guild_id, uid, "pages", title, str(start), joined_at=joined_at)
+        sprint = active_sprints.get(guild_id)
+        if not sprint:
+            await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
+            return
+        sprint["participants"][uid] = {
             "type": "pages", "title": title, "start": start, "end": None, "joined_at": joined_at,
             "gg_awarded": False, "segments": [],
         }
-        await interaction.client.db.save_sprint_participant(guild_id, uid, "pages", title, str(start), joined_at=joined_at)
         suffix = f" — reading **{title}**" if title else ""
         await interaction.response.send_message(
             f"✅ {interaction.user.mention} joined at 📖 **page {start}**{suffix}!", ephemeral=False
@@ -303,14 +309,19 @@ class JoinAudioPctModal(SafeModal, title="Join Sprint — Audio %"):
             return
         uid = interaction.user.id
         joined_at = datetime.utcnow()
-        active_sprints[guild_id]["participants"][uid] = {
+        # Persist before touching memory (see JoinPagesModal) so a failed save leaves no ghost entry.
+        await interaction.client.db.save_sprint_participant(guild_id, uid, "audio_pct", title, str(pct), joined_at=joined_at)
+        if title:
+            await interaction.client.db.save_sprint_book_meta(uid, guild_id, title, total_minutes=total_mins)
+        sprint = active_sprints.get(guild_id)
+        if not sprint:
+            await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
+            return
+        sprint["participants"][uid] = {
             "type": "audio_pct", "title": title, "start": pct,
             "end": None, "joined_at": joined_at, "gg_awarded": False,
             "total_minutes": total_mins, "segments": [],
         }
-        await interaction.client.db.save_sprint_participant(guild_id, uid, "audio_pct", title, str(pct), joined_at=joined_at)
-        if title:
-            await interaction.client.db.save_sprint_book_meta(uid, guild_id, title, total_minutes=total_mins)
         start_str = f"{pct:.1f}%".rstrip("0").rstrip(".")
         await interaction.response.send_message(
             f"✅ {interaction.user.mention} joined at 🎧 **{start_str}** — listening to **{title}**!", ephemeral=False
@@ -545,6 +556,7 @@ class SwitchBookNewModal(SafeModal):
             return
         data = sprint["participants"][uid]
         title = self.title_input.value.strip()
+        total_mins = None
         try:
             if self.ptype == "pages":
                 start = int(self.start_input.value)
@@ -556,16 +568,18 @@ class SwitchBookNewModal(SafeModal):
                         "Please enter a valid total length as hours or `hh:mm`.", ephemeral=True
                     )
                     return
-                data["total_minutes"] = total_mins
         except ValueError:
             await interaction.response.send_message("Please enter valid numbers.", ephemeral=True)
             return
-        data["title"] = title
-        data["start"] = start
-        data["end"] = None
+        # Persist before touching memory so a failed save doesn't leave the two out of sync.
         await interaction.client.db.save_sprint_participant(
             guild_id, uid, self.ptype, title, str(start), joined_at=data.get("joined_at")
         )
+        if total_mins:
+            data["total_minutes"] = total_mins
+        data["title"] = title
+        data["start"] = start
+        data["end"] = None
         await interaction.response.send_message(
             f"📖 {interaction.user.mention} switched to **{title}** — tracking continues!", ephemeral=False
         )
@@ -1179,7 +1193,13 @@ class Sprints(commands.Cog):
 
         view = LogProgressView(self)
         end_embed = self._build_end_embed(guild_id, deadline)
-        end_msg = await channel.send(embed=end_embed, view=view)
+        # Mentions inside an embed render but never notify — the ping has to be message content.
+        ping_ids = [uid for uid, d in sprint["participants"].items() if not d.get("left")]
+        ping_mentions = " ".join(f"<@{uid}>" for uid in ping_ids) or None
+        end_msg = await channel.send(
+            content=ping_mentions, embed=end_embed, view=view,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
         self._end_message[guild_id] = (channel.id, end_msg.id)
 
         task = asyncio.ensure_future(asyncio.sleep(LOG_WINDOW_MINUTES * 60))

@@ -152,6 +152,10 @@ class Database:
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
+        # CREATE TABLE IF NOT EXISTS never alters a table that's already deployed, so every
+        # column added after a table first shipped needs its own ALTER or the live DB never gets it.
+        await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS active_seconds INTEGER DEFAULT 0;")
+        await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS resumed_at TIMESTAMP;")
         await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS segments TEXT;")
         await self._execute("""
             CREATE TABLE IF NOT EXISTS sprint_book_meta (
