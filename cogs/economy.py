@@ -597,7 +597,7 @@ class RaceConfigGroup(GriffinModGroup):
 
     @app_commands.command(
         name="timezone",
-        description="Set the timezone used to interpret scheduled sprint start times."
+        description="Server fallback timezone for scheduled sprint times (people can set their own)."
     )
     @app_commands.describe(timezone="IANA timezone name, e.g. America/New_York or Europe/London")
     async def timezone(self, interaction: discord.Interaction, timezone: str):
@@ -695,6 +695,7 @@ async def help_command(interaction: discord.Interaction):
             "**/race leaderboard** — View the sprint leaderboard",
             "**/race edit** — Edit or delete one of your sprint logs",
             "**/race scheduled** — See the upcoming scheduled sprints (and pre-join from there)",
+            "**/race timezone** — Set your timezone, used to read the times you type when scheduling",
         ])
     )
     await interaction.response.send_message(embed=embed)
@@ -754,14 +755,14 @@ class StaffGroup(GriffinModGroup):
                 "**/staff channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
                 "**/staff channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
-                "**/race schedule** — Schedule a sprint ahead of time (one at a time; needs "
-                "`/staff race timezone` set first)",
+                "**/race schedule** — Schedule a sprint ahead of time (one at a time). Start with a time "
+                "like `14:30` (your own timezone, asked once) or a countdown like `in 1h30m`",
                 "**/race unschedule** `<sprint>` — Cancel a scheduled sprint",
                 "**/race cancel** — Force-cancel the sprint that's running or collecting logs",
                 "**/staff race ping-role** `<role>` — Set the role pinged when a sprint starts",
                 "**/staff race librarian-role** `<role>` — Set who can manage sprints and gets "
                 "pinged with results",
-                "**/staff race timezone** `<timezone>` — Set the timezone for scheduled sprint times",
+                "**/staff race timezone** `<timezone>` — Server fallback timezone (offered to people who haven't set their own)",
             ])
         )
         await interaction.response.send_message(embed=embed)

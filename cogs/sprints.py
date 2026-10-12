@@ -4,8 +4,9 @@ from discord import app_commands
 from datetime import timezone, timedelta, datetime
 import asyncio
 import json
+import re
 import traceback
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from cogs.economy import _award_gg
 from utils.emojis import emoji as _emoji
@@ -140,7 +141,11 @@ def _parse_schedule_when(date_raw: str, time_raw: str, tz: ZoneInfo):
     """Reads a typed date + clock time as being in `tz`. Returns (aware datetime, None) or (None, error)."""
     date_raw = date_raw.strip()
     d = None
+    if not date_raw:                                    # no date typed -> today, in their timezone
+        d = datetime.now(tz).date()
     for fmt in _DATE_FORMATS:
+        if d is not None:
+            break
         try:
             d = datetime.strptime(date_raw, fmt).date()
             break
@@ -166,8 +171,75 @@ def _parse_schedule_when(date_raw: str, time_raw: str, tz: ZoneInfo):
         except ValueError:
             continue
     if t is None:
-        return None, "I couldn't read that time — use 24-hour time like `14:30` (or `2:30pm`)."
+        return None, "I couldn't read that time — use `14:30` or `2:30pm`, or a countdown like `in 1h30m`."
     return datetime.combine(d, t, tzinfo=tz), None
+
+
+_RELATIVE_RE = re.compile(
+    r"^(?:in|\+)?\s*"
+    r"(?:(?P<h>\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h))?\s*"
+    r"(?:(?P<m>\d+)\s*(?:minutes?|mins?|m))?$"
+)
+_MAX_START_AFTER = timedelta(days=30)
+
+
+def _parse_start_after(raw: str):
+    """Reads "in 1h30m" / "+90m" / "2 hours" as an offset from now. Returns (timedelta, None) when it is one,
+    (None, None) when it's not a relative time at all (so a clock time like 2pm falls through), or
+    (None, error) when it is relative but unusable. A bare number counts only with an "in"/"+" prefix."""
+    text = (raw or "").strip().lower()
+    if not text:
+        return None, None
+    m = _RELATIVE_RE.match(text)
+    if not m or (m.group("h") is None and m.group("m") is None):
+        bare = re.fullmatch(r"(?:in|\+)\s*(\d+)", text)      # "in 90" / "+45" -> minutes
+        if not bare:
+            return None, None
+        delta = timedelta(minutes=int(bare.group(1)))
+    else:
+        if not (text.startswith(("in", "+")) or any(c.isalpha() for c in text)):
+            return None, None
+        delta = timedelta(hours=float(m.group("h") or 0), minutes=int(m.group("m") or 0))
+    if delta < timedelta(minutes=2):
+        return None, "That's too soon — pick a start at least 2 minutes from now (e.g. `in 30m`)."
+    if delta > _MAX_START_AFTER:
+        return None, "That's more than 30 days away — use a date and time for far-off sprints."
+    return delta, None
+
+
+_TZ_ALIASES = {
+    "EST": "America/New_York", "EDT": "America/New_York", "ET": "America/New_York",
+    "CST": "America/Chicago", "CDT": "America/Chicago", "CT": "America/Chicago",
+    "MST": "America/Denver", "MDT": "America/Denver", "MT": "America/Denver",
+    "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles", "PT": "America/Los_Angeles",
+    "AKST": "America/Anchorage", "AKDT": "America/Anchorage", "HST": "Pacific/Honolulu",
+    "GMT": "Europe/London", "BST": "Europe/London", "UTC": "UTC",
+    "CET": "Europe/Paris", "CEST": "Europe/Paris", "EET": "Europe/Athens", "EEST": "Europe/Athens",
+    "IST": "Asia/Kolkata", "JST": "Asia/Tokyo", "AEST": "Australia/Sydney", "AEDT": "Australia/Sydney",
+    "NZST": "Pacific/Auckland", "NZDT": "Pacific/Auckland",
+}
+_tz_lookup: dict[str, str] | None = None
+
+
+def _resolve_timezone(raw: str):
+    """Typed timezone -> a proper IANA name, or None. Accepts US/EU abbreviations (EST, PST, ...) and any
+    capitalisation of an IANA name (America/New_York, america/new_york)."""
+    global _tz_lookup
+    text = (raw or "").strip().replace(" ", "_")
+    if not text:
+        return None
+    if text.upper() in _TZ_ALIASES:
+        return _TZ_ALIASES[text.upper()]
+    if _tz_lookup is None:
+        _tz_lookup = {n.lower(): n for n in available_timezones()}
+    name = _tz_lookup.get(text.lower())
+    if name is None:
+        try:                                    # tz data present but not enumerable
+            ZoneInfo(text)
+            name = text
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
+    return name
 
 
 def _deserialize_start(ptype, val):
@@ -950,14 +1022,36 @@ class LogProgressView(SafeView):
 
 # ── Scheduling UI ─────────────────────────────────────────────────────────────
 
+# Common zones for the first-time picker (IANA name -> label). Anything else goes through "Other…".
+_COMMON_ZONES = [
+    ("America/New_York", "Eastern"), ("America/Chicago", "Central"), ("America/Denver", "Mountain"),
+    ("America/Phoenix", "Arizona"), ("America/Los_Angeles", "Pacific"), ("America/Anchorage", "Alaska"),
+    ("Pacific/Honolulu", "Hawaii"), ("America/Halifax", "Atlantic Canada"), ("America/Mexico_City", "Mexico City"),
+    ("America/Sao_Paulo", "Brazil"), ("Europe/London", "UK"), ("Europe/Paris", "Central Europe"),
+    ("Europe/Athens", "Eastern Europe"), ("Europe/Moscow", "Moscow"), ("Africa/Johannesburg", "South Africa"),
+    ("Asia/Dubai", "Gulf"), ("Asia/Kolkata", "India"), ("Asia/Singapore", "Singapore"), ("Asia/Tokyo", "Japan"),
+    ("Australia/Perth", "Perth"), ("Australia/Sydney", "Sydney"), ("Pacific/Auckland", "New Zealand"),
+]
+
+
+def _utc_offset_label(tz_name: str) -> str:
+    off = datetime.now(ZoneInfo(tz_name)).utcoffset() or timedelta(0)
+    minutes = int(off.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    h, m = divmod(abs(minutes), 60)
+    return f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
+
 class ScheduleSprintModal(SafeModal, title="Schedule a Sprint"):
     sprint_title = discord.ui.TextInput(label="Sprint title", placeholder="e.g. Block 1/7 Sprint 2/5", max_length=80)
     blurb = discord.ui.TextInput(
         label="Description (optional)", style=discord.TextStyle.paragraph, required=False, max_length=500,
         placeholder="Anything patrons should know about this sprint",
     )
-    date_input = discord.ui.TextInput(label="Date (YYYY-MM-DD)", placeholder="e.g. 2026-10-24", max_length=12)
-    time_input = discord.ui.TextInput(label="Start time (24-hour, e.g. 14:30)", placeholder="14:30", max_length=8)
+    date_input = discord.ui.TextInput(
+        label="Date (YYYY-MM-DD, blank = today)", placeholder="e.g. 2026-10-24", required=False, max_length=12
+    )
+    time_input = discord.ui.TextInput(label="Start (14:30, 2:30pm, or in 1h30m)", placeholder="14:30  or  in 1h30m", max_length=16)
 
     def __init__(self, cog, tz_name: str, prefill_date: str | None = None):
         super().__init__()
@@ -967,38 +1061,138 @@ class ScheduleSprintModal(SafeModal, title="Schedule a Sprint"):
             self.date_input.default = prefill_date
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            tz = ZoneInfo(self.tz_name)
-        except (ZoneInfoNotFoundError, ValueError):
-            await interaction.response.send_message(
-                "❌ The server's sprint timezone isn't valid — re-set it with `/staff race timezone`.", ephemeral=True
-            )
-            return
         title = self.sprint_title.value.strip()
         if not title:
             await interaction.response.send_message("❌ A sprint needs a title.", ephemeral=True)
             return
-        when, err = _parse_schedule_when(self.date_input.value, self.time_input.value, tz)
+        date_text = (self.date_input.value or "").strip()
+        delta, err = _parse_start_after(self.time_input.value)
         if err:
             await interaction.response.send_message(f"❌ {err}", ephemeral=True)
             return
-        start_utc = when.astimezone(timezone.utc)
+        if delta is not None:                       # "in 1h30m": counted from now, no timezone involved
+            start_utc = (discord.utils.utcnow() + delta).replace(second=0, microsecond=0)
+            entered = f"in {_format_duration(int(delta.total_seconds() // 60))}"
+        else:
+            try:
+                tz = ZoneInfo(self.tz_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                await interaction.response.send_message(
+                    "❌ Your saved timezone isn't valid — set it again with `/race timezone`.", ephemeral=True
+                )
+                return
+            when, err = _parse_schedule_when(date_text, self.time_input.value, tz)
+            if err:
+                await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+                return
+            start_utc = when.astimezone(timezone.utc)
+            entered = f"{when.strftime('%a %b %d, %H:%M')} ({self.tz_name})"
         if start_utc <= discord.utils.utcnow() + timedelta(minutes=1):
+            hint = "" if date_text else " Add a date to schedule it for another day."
             await interaction.response.send_message(
-                f"❌ That start time is already past (or less than a minute away) in **{self.tz_name}** time.",
-                ephemeral=True
+                f"❌ That start time is already past (or less than a minute away).{hint}", ephemeral=True
             )
             return
         view = ScheduleDurationView(
             self.cog, interaction.user.id, interaction.channel.id, title,
-            (self.blurb.value or "").strip() or None, start_utc, self.tz_name, self.date_input.value.strip(),
+            (self.blurb.value or "").strip() or None, start_utc, self.tz_name, date_text,
         )
         await interaction.response.send_message(
             f"⏱️ How long should **{title}** run?\n"
-            f"Starts {discord.utils.format_dt(start_utc, 'F')} — you entered "
-            f"**{when.strftime('%a %b %d, %H:%M')}** ({self.tz_name}).",
+            f"Starts {discord.utils.format_dt(start_utc, 'F')} ({discord.utils.format_dt(start_utc, 'R')}) — "
+            f"you entered **{entered}**.",
             view=view, ephemeral=True
         )
+
+
+class TimezoneModal(SafeModal, title="Your timezone"):
+    zone = discord.ui.TextInput(
+        label="Timezone", placeholder="e.g. America/Toronto, Europe/Berlin, EST, PST", max_length=40
+    )
+
+    def __init__(self, cog, then_schedule: bool):
+        super().__init__()
+        self.cog, self.then_schedule = cog, then_schedule
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = _resolve_timezone(self.zone.value)
+        if not name:
+            await interaction.response.send_message(
+                f"❌ I don't know a timezone called `{self.zone.value.strip()[:40]}`. Use a city-style name like "
+                "`America/Toronto` or `Europe/Berlin`, or an abbreviation like `EST`.", ephemeral=True
+            )
+            return
+        await self.cog.bot.db.set_user_timezone(interaction.user.id, name)
+        text = (f"✅ Saved — I'll read your times as **{name}** ({_utc_offset_label(name)}). "
+                "Change it any time with `/race timezone`.")
+        if self.then_schedule:
+            await interaction.response.send_message(
+                text, view=ContinueScheduleView(self.cog, interaction.user.id, name), ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+
+class ContinueScheduleView(SafeView):
+    """Modals can't open modals, so after typing a timezone the scheduler continues with a button."""
+
+    def __init__(self, cog, owner_id: int, tz_name: str):
+        super().__init__(timeout=300)
+        self.cog, self.owner_id, self.tz_name = cog, owner_id, tz_name
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Run `/race schedule` to schedule your own.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Continue scheduling", style=discord.ButtonStyle.success)
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ScheduleSprintModal(self.cog, self.tz_name))
+
+
+class TimezonePickView(SafeView):
+    """One-time (and /race timezone) picker. Picking a zone saves it; from /race schedule it then opens
+    the schedule form straight away."""
+
+    def __init__(self, cog, owner_id: int, then_schedule: bool, server_tz: str | None = None):
+        super().__init__(timeout=300)
+        self.cog, self.owner_id, self.then_schedule = cog, owner_id, then_schedule
+        options = []
+        if server_tz:
+            options.append(discord.SelectOption(
+                label=f"Use the server's timezone ({server_tz})"[:100], value=f"server|{server_tz}"
+            ))
+        for name, label in _COMMON_ZONES:
+            try:
+                options.append(discord.SelectOption(label=f"{label} ({_utc_offset_label(name)})", value=name,
+                                                    description=name))
+            except (ZoneInfoNotFoundError, ValueError):
+                continue                        # tz data missing on this host; skip rather than crash
+        options.append(discord.SelectOption(label="Other… (type it in)", value="__other__"))
+        select = discord.ui.Select(placeholder="Pick your timezone", options=options[:25])
+        select.callback = self._picked
+        self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This picker belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    async def _picked(self, interaction: discord.Interaction):
+        value = interaction.data["values"][0]
+        if value == "__other__":
+            await interaction.response.send_modal(TimezoneModal(self.cog, self.then_schedule))
+            return
+        name = value.split("|", 1)[1] if value.startswith("server|") else value
+        await self.cog.bot.db.set_user_timezone(interaction.user.id, name)
+        if self.then_schedule:
+            await interaction.response.send_modal(ScheduleSprintModal(self.cog, name))
+        else:
+            await interaction.response.edit_message(
+                content=f"✅ Saved — I'll read your times as **{name}** ({_utc_offset_label(name)}).", view=None
+            )
 
 
 class ScheduleDurationView(SafeView):
@@ -1621,14 +1815,47 @@ class Sprints(commands.Cog):
                 "❌ You don't have permission to schedule sprints.", ephemeral=True
             )
             return
-        tz_name = settings.get("sprint_timezone")
-        if not tz_name:
+        tz_name = await self.bot.db.get_user_timezone(interaction.user.id)
+        if tz_name:
+            try:
+                ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                tz_name = None
+        if not tz_name:                             # first time: ask once, remember it
             await interaction.response.send_message(
-                "❌ Set the server's timezone first, so I know what \"14:30\" means: "
-                "`/staff race timezone` (e.g. `America/New_York`).", ephemeral=True
+                "🌍 First time scheduling — what's your timezone? I'll remember it, and use it to read the "
+                "start times you type. (Starting with a countdown like `in 1h30m` needs no timezone.)",
+                view=TimezonePickView(self, interaction.user.id, True, settings.get("sprint_timezone")),
+                ephemeral=True,
             )
             return
         await interaction.response.send_modal(ScheduleSprintModal(self, tz_name))
+
+    @race.command(name="timezone", description="Set or check the timezone I use to read your typed times.")
+    @app_commands.describe(zone="Optional: a timezone to save, e.g. America/Toronto or EST. Leave blank to pick from a list.")
+    async def sprint_timezone(self, interaction: discord.Interaction, zone: str | None = None):
+        db = self.bot.db
+        if zone:
+            name = _resolve_timezone(zone)
+            if not name:
+                await interaction.response.send_message(
+                    f"❌ I don't know a timezone called `{zone[:40]}`. Use a city-style name like "
+                    "`America/Toronto` or `Europe/Berlin`, or an abbreviation like `EST`.", ephemeral=True
+                )
+                return
+            await db.set_user_timezone(interaction.user.id, name)
+            await interaction.response.send_message(
+                f"✅ Saved — I'll read your times as **{name}** ({_utc_offset_label(name)}).", ephemeral=True
+            )
+            return
+        current = await db.get_user_timezone(interaction.user.id)
+        settings = await db.get_guild_config(interaction.guild.id)
+        head = (f"🌍 Your timezone is **{current}** ({_utc_offset_label(current)}). Pick another to change it:"
+                if current else "🌍 You haven't set a timezone yet. Pick yours:")
+        await interaction.response.send_message(
+            head, view=TimezonePickView(self, interaction.user.id, False, settings.get("sprint_timezone")),
+            ephemeral=True,
+        )
 
     @race.command(name="scheduled", description="See the upcoming scheduled sprints.")
     async def sprint_scheduled(self, interaction: discord.Interaction):

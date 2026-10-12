@@ -201,6 +201,12 @@ class Database:
             )
         """)
         await self._execute("""
+            CREATE TABLE IF NOT EXISTS user_timezones (
+                user_id BIGINT PRIMARY KEY,
+                tz_name TEXT NOT NULL
+            )
+        """)
+        await self._execute("""
             CREATE TABLE IF NOT EXISTS sprint_book_meta (
                 user_id BIGINT NOT NULL,
                 guild_id BIGINT NOT NULL,
@@ -443,6 +449,18 @@ class Database:
             ON CONFLICT (guild_id)
             DO UPDATE SET sprint_timezone = %s
         """, guild_id, tz_name, tz_name)
+
+    async def get_user_timezone(self, user_id: int):
+        row = await self._fetchone("SELECT tz_name FROM user_timezones WHERE user_id=%s", user_id)
+        return row["tz_name"] if row else None
+
+    async def set_user_timezone(self, user_id: int, tz_name: str):
+        await self._execute("""
+            INSERT INTO user_timezones (user_id, tz_name)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET tz_name = %s
+        """, user_id, tz_name, tz_name)
 
     async def set_message_rate(self, guild_id: int, amount: int, cooldown: int):
         await self._execute("""
