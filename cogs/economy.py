@@ -694,6 +694,7 @@ async def help_command(interaction: discord.Interaction):
             "**/race stats** `[member]` — View sprint stats for yourself or another member",
             "**/race leaderboard** — View the sprint leaderboard",
             "**/race edit** — Edit or delete one of your sprint logs",
+            "**/race scheduled** — See the upcoming scheduled sprints (and pre-join from there)",
         ])
     )
     await interaction.response.send_message(embed=embed)
@@ -753,6 +754,10 @@ class StaffGroup(GriffinModGroup):
                 "**/staff channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
                 "**/staff channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
+                "**/race schedule** — Schedule a sprint ahead of time (one at a time; needs "
+                "`/staff race timezone` set first)",
+                "**/race unschedule** `<sprint>` — Cancel a scheduled sprint",
+                "**/race cancel** — Force-cancel the sprint that's running or collecting logs",
                 "**/staff race ping-role** `<role>` — Set the role pinged when a sprint starts",
                 "**/staff race librarian-role** `<role>` — Set who can manage sprints and gets "
                 "pinged with results",

@@ -1,15 +1,17 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from datetime import timezone, timedelta, datetime
 import asyncio
 import json
 import traceback
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cogs.economy import _award_gg
 from utils.emojis import emoji as _emoji
 
 LOG_WINDOW_MINUTES = 7
+SCHEDULED_JOIN_MINUTES = 5   # joining window before a scheduled sprint's focus time
 RACE_COLOR = discord.Color(0x26878D)
 
 active_sprints: dict[int, dict] = {}
@@ -106,6 +108,66 @@ async def _get_channel(guild, channel_id):
         except Exception:
             pass
     return ch
+
+
+def _aware(dt):
+    """DB timestamps are naive UTC; Discord timestamps / comparisons want aware."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _message_url(guild_id: int, channel_id: int, message_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+
+def _can_manage_sprints(interaction: discord.Interaction, settings: dict) -> bool:
+    """Race librarian-role, griffin-wide manager-role, or Manage Server. If neither role has been
+    configured yet, sprint management is open (that's the pre-existing behaviour)."""
+    race_role = settings.get("sprint_manager_role_id")
+    griffin_role = settings.get("griffin_manager_role_id")
+    if not (race_role or griffin_role):
+        return True
+    user_roles = {r.id for r in getattr(interaction.user, "roles", [])}
+    return (race_role in user_roles or griffin_role in user_roles
+            or interaction.user.guild_permissions.manage_guild)
+
+
+_DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y")
+
+
+def _parse_schedule_when(date_raw: str, time_raw: str, tz: ZoneInfo):
+    """Reads a typed date + clock time as being in `tz`. Returns (aware datetime, None) or (None, error)."""
+    date_raw = date_raw.strip()
+    d = None
+    for fmt in _DATE_FORMATS:
+        try:
+            d = datetime.strptime(date_raw, fmt).date()
+            break
+        except ValueError:
+            continue
+    if d is None:
+        try:  # month/day with no year -> this year
+            d = datetime.strptime(date_raw, "%m/%d").replace(year=datetime.now(tz).year).date()
+        except ValueError:
+            pass
+    if d is None:
+        return None, "I couldn't read that date — use `YYYY-MM-DD` (e.g. `2026-10-24`) or `MM/DD/YYYY`."
+
+    cleaned = time_raw.strip().replace(" ", "").upper()
+    t = None
+    formats = ["%H:%M", "%I:%M%p", "%I%p"]
+    if cleaned.isdigit() and len(cleaned) == 4:        # "1430" — but never read "14" as 01:04
+        formats.insert(1, "%H%M")
+    for fmt in formats:
+        try:
+            t = datetime.strptime(cleaned, fmt).time()
+            break
+        except ValueError:
+            continue
+    if t is None:
+        return None, "I couldn't read that time — use 24-hour time like `14:30` (or `2:30pm`)."
+    return datetime.combine(d, t, tzinfo=tz), None
 
 
 def _deserialize_start(ptype, val):
@@ -232,9 +294,13 @@ class EmbedPaginatorView(SafeView):
         await interaction.response.edit_message(embed=self.embeds[self.index], view=self)
 
 
-def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit: int = 3500) -> list[discord.Embed]:
+def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit: int = 3500,
+                    header: str | None = None) -> list[discord.Embed]:
     """One embed holds as many lines as fit under the description cap (4096); only start a new page
-    when it's genuinely full. `per_page` is just a sanity ceiling, not a readability cap."""
+    when it's genuinely full. `per_page` is just a sanity ceiling, not a readability cap. `header`
+    (e.g. a sprint's title) is repeated at the top of every page."""
+    if header:
+        char_limit -= len(header) + 2
     pages: list[list[str]] = []
     current: list[str] = []
     current_len = 0
@@ -249,7 +315,11 @@ def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit
     if not pages:
         pages = [[]]
     return [
-        discord.Embed(title=title, description="\n\n".join(p) or "Nothing here yet.", color=RACE_COLOR)
+        discord.Embed(
+            title=title,
+            description=(f"{header}\n\n" if header else "") + ("\n\n".join(p) or "Nothing here yet."),
+            color=RACE_COLOR,
+        )
         for p in pages
     ]
 
@@ -260,13 +330,27 @@ class JoinPagesModal(SafeModal, title="Join Sprint — Pages"):
     reading = discord.ui.TextInput(label="Reading title", placeholder="What are you reading?", required=False)
     start_page = discord.ui.TextInput(label="Starting page", placeholder="e.g. 42", default="0")
 
-    def __init__(self, cog, prefill_title: str | None = None):
+    def __init__(self, cog, prefill_title: str | None = None, scheduled_id: int | None = None):
         super().__init__()
         self.cog = cog
+        self.scheduled_id = scheduled_id      # set when this is a *pre-join* for a scheduled sprint
         if prefill_title:
             self.reading.default = prefill_title
 
     async def on_submit(self, interaction: discord.Interaction):
+        if self.scheduled_id is not None:
+            try:
+                start = int(self.start_page.value)
+            except ValueError:
+                start = 0
+            title = self.reading.value or None
+            if await self.cog._save_prejoin(interaction, self.scheduled_id, "pages", title, str(start)):
+                suffix = f" — reading **{title}**" if title else ""
+                await interaction.response.send_message(
+                    f"✅ {interaction.user.mention} pre-joined at 📖 **page {start}**{suffix}!", ephemeral=False
+                )
+                await self.cog._update_scheduled_embed(interaction.guild, self.scheduled_id)
+            return
         guild_id = interaction.guild.id
         if guild_id not in active_sprints:
             await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
@@ -304,9 +388,11 @@ class JoinAudioPctModal(SafeModal, title="Join Sprint — Audio %"):
     total_hours = discord.ui.TextInput(label="Total audiobook length (hh:mm or hours)", placeholder="e.g. 12 or 12:30")
     start_pct = discord.ui.TextInput(label="Starting percentage", placeholder="e.g. 24")
 
-    def __init__(self, cog, prefill_title: str | None = None, prefill_total_mins: int | None = None):
+    def __init__(self, cog, prefill_title: str | None = None, prefill_total_mins: int | None = None,
+                 scheduled_id: int | None = None):
         super().__init__()
         self.cog = cog
+        self.scheduled_id = scheduled_id      # set when this is a *pre-join* for a scheduled sprint
         if prefill_title:
             self.listening.default = prefill_title
         if prefill_total_mins:
@@ -323,7 +409,40 @@ class JoinAudioPctModal(SafeModal, title="Join Sprint — Audio %"):
         except ValueError:
             return None
 
+    async def _read_inputs(self, interaction: discord.Interaction):
+        """(title, pct, total_minutes), or None after telling the user what to fix."""
+        title = self.listening.value.strip()
+        try:
+            pct = float(self.start_pct.value.replace("%", "").strip())
+        except ValueError:
+            await interaction.response.send_message("Please enter a valid percentage.", ephemeral=True)
+            return None
+        total_mins = self._parse_total_minutes(self.total_hours.value)
+        if not total_mins:
+            await interaction.response.send_message(
+                "Please enter the total audiobook length as hours (e.g. `12`) or `hh:mm` (e.g. `12:30`).",
+                ephemeral=True
+            )
+            return None
+        return title, pct, total_mins
+
     async def on_submit(self, interaction: discord.Interaction):
+        if self.scheduled_id is not None:
+            inputs = await self._read_inputs(interaction)
+            if inputs is None:
+                return
+            title, pct, total_mins = inputs
+            if await self.cog._save_prejoin(interaction, self.scheduled_id, "audio_pct", title, str(pct), total_mins):
+                if title:
+                    await interaction.client.db.save_sprint_book_meta(
+                        interaction.user.id, interaction.guild.id, title, total_minutes=total_mins)
+                start_str = f"{pct:.1f}%".rstrip("0").rstrip(".")
+                await interaction.response.send_message(
+                    f"✅ {interaction.user.mention} pre-joined at 🎧 **{start_str}** — listening to **{title}**!",
+                    ephemeral=False
+                )
+                await self.cog._update_scheduled_embed(interaction.guild, self.scheduled_id)
+            return
         guild_id = interaction.guild.id
         if guild_id not in active_sprints:
             await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
@@ -331,23 +450,15 @@ class JoinAudioPctModal(SafeModal, title="Join Sprint — Audio %"):
         if interaction.user.id in active_sprints[guild_id].get("participants", {}):
             await interaction.response.send_message("You've already joined this sprint!", ephemeral=True)
             return
-        title = self.listening.value.strip()
-        try:
-            pct = float(self.start_pct.value.replace("%", "").strip())
-        except ValueError:
-            await interaction.response.send_message("Please enter a valid percentage.", ephemeral=True)
+        inputs = await self._read_inputs(interaction)
+        if inputs is None:
             return
-        total_mins = self._parse_total_minutes(self.total_hours.value)
-        if not total_mins:
-            await interaction.response.send_message(
-                "Please enter the total audiobook length as hours (e.g. `12`) or `hh:mm` (e.g. `12:30`).",
-                ephemeral=True
-            )
-            return
+        title, pct, total_mins = inputs
         uid = interaction.user.id
         joined_at = datetime.utcnow()
         # Persist before touching memory (see JoinPagesModal) so a failed save leaves no ghost entry.
-        await interaction.client.db.save_sprint_participant(guild_id, uid, "audio_pct", title, str(pct), joined_at=joined_at)
+        await interaction.client.db.save_sprint_participant(
+            guild_id, uid, "audio_pct", title, str(pct), joined_at=joined_at, total_minutes=total_mins)
         if title:
             await interaction.client.db.save_sprint_book_meta(uid, guild_id, title, total_minutes=total_mins)
         sprint = active_sprints.get(guild_id)
@@ -632,7 +743,7 @@ class SwitchBookNewModal(SafeModal):
         segments = list(data.get("segments") or []) + [pending]
         await interaction.client.db.switch_sprint_participant_book(
             guild_id, uid, self.ptype, title, str(start), json.dumps(segments),
-            joined_at=data.get("joined_at")
+            joined_at=data.get("joined_at"), total_minutes=total_mins or data.get("total_minutes")
         )
         data["segments"] = segments
         data.pop("pending_segment", None)
@@ -650,9 +761,10 @@ class SwitchBookNewModal(SafeModal):
 # ── Views ─────────────────────────────────────────────────────────────────────
 
 class BookSelectView(SafeView):
-    def __init__(self, cog, titles: list[str], modal_type: str):
+    def __init__(self, cog, titles: list[str], modal_type: str, scheduled_id: int | None = None):
         super().__init__(timeout=60)
         self.cog = cog
+        self.scheduled_id = scheduled_id
         options = [discord.SelectOption(label=t[:100], value=t[:100]) for t in titles]
         options.append(discord.SelectOption(label="Enter a different title...", value="__new__"))
         select = discord.ui.Select(placeholder="Pick a recent book or enter a new one...", options=options)
@@ -668,22 +780,25 @@ class BookSelectView(SafeView):
             if chosen != "__new__":
                 meta = await interaction.client.db.get_sprint_book_meta(uid, guild_id, chosen)
             if modal_type == "pages":
-                modal = JoinPagesModal(self.cog, prefill_title=chosen if chosen != "__new__" else None)
+                modal = JoinPagesModal(self.cog, prefill_title=chosen if chosen != "__new__" else None,
+                                       scheduled_id=self.scheduled_id)
             else:
                 total_mins = meta.get("total_minutes") if meta else None
                 modal = JoinAudioPctModal(
                     self.cog,
                     prefill_title=chosen if chosen != "__new__" else None,
-                    prefill_total_mins=total_mins
+                    prefill_total_mins=total_mins,
+                    scheduled_id=self.scheduled_id,
                 )
             await interaction.response.send_modal(modal)
         return callback
 
 
 class JoinTypeView(SafeView):
-    def __init__(self, cog):
+    def __init__(self, cog, scheduled_id: int | None = None):
         super().__init__(timeout=120)
         self.cog = cog
+        self.scheduled_id = scheduled_id
 
     @discord.ui.select(
         placeholder="How are you tracking?",
@@ -696,11 +811,11 @@ class JoinTypeView(SafeView):
         ptype = select.values[0]
         titles = await interaction.client.db.get_recent_sprint_titles(interaction.guild.id, interaction.user.id, limit=3)
         if titles:
-            view = BookSelectView(self.cog, [r["title"] for r in titles], ptype)
+            view = BookSelectView(self.cog, [r["title"] for r in titles], ptype, self.scheduled_id)
             await interaction.response.edit_message(content="📚 Pick your book:", view=view)
         else:
             modal_cls = JoinPagesModal if ptype == "pages" else JoinAudioPctModal
-            await interaction.response.send_modal(modal_cls(self.cog))
+            await interaction.response.send_modal(modal_cls(self.cog, scheduled_id=self.scheduled_id))
 
 
 class ResumeOrFreshView(SafeView):
@@ -833,6 +948,144 @@ class LogProgressView(SafeView):
         await interaction.response.send_modal(modal_cls(self.cog))
 
 
+# ── Scheduling UI ─────────────────────────────────────────────────────────────
+
+class ScheduleSprintModal(SafeModal, title="Schedule a Sprint"):
+    sprint_title = discord.ui.TextInput(label="Sprint title", placeholder="e.g. Block 1/7 Sprint 2/5", max_length=80)
+    blurb = discord.ui.TextInput(
+        label="Description (optional)", style=discord.TextStyle.paragraph, required=False, max_length=500,
+        placeholder="Anything patrons should know about this sprint",
+    )
+    date_input = discord.ui.TextInput(label="Date (YYYY-MM-DD)", placeholder="e.g. 2026-10-24", max_length=12)
+    time_input = discord.ui.TextInput(label="Start time (24-hour, e.g. 14:30)", placeholder="14:30", max_length=8)
+
+    def __init__(self, cog, tz_name: str, prefill_date: str | None = None):
+        super().__init__()
+        self.cog = cog
+        self.tz_name = tz_name
+        if prefill_date:
+            self.date_input.default = prefill_date
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            tz = ZoneInfo(self.tz_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            await interaction.response.send_message(
+                "❌ The server's sprint timezone isn't valid — re-set it with `/staff race timezone`.", ephemeral=True
+            )
+            return
+        title = self.sprint_title.value.strip()
+        if not title:
+            await interaction.response.send_message("❌ A sprint needs a title.", ephemeral=True)
+            return
+        when, err = _parse_schedule_when(self.date_input.value, self.time_input.value, tz)
+        if err:
+            await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+            return
+        start_utc = when.astimezone(timezone.utc)
+        if start_utc <= discord.utils.utcnow() + timedelta(minutes=1):
+            await interaction.response.send_message(
+                f"❌ That start time is already past (or less than a minute away) in **{self.tz_name}** time.",
+                ephemeral=True
+            )
+            return
+        view = ScheduleDurationView(
+            self.cog, interaction.user.id, interaction.channel.id, title,
+            (self.blurb.value or "").strip() or None, start_utc, self.tz_name, self.date_input.value.strip(),
+        )
+        await interaction.response.send_message(
+            f"⏱️ How long should **{title}** run?\n"
+            f"Starts {discord.utils.format_dt(start_utc, 'F')} — you entered "
+            f"**{when.strftime('%a %b %d, %H:%M')}** ({self.tz_name}).",
+            view=view, ephemeral=True
+        )
+
+
+class ScheduleDurationView(SafeView):
+    def __init__(self, cog, owner_id: int, channel_id: int, title: str, description: str | None,
+                 start_utc, tz_name: str, date_text: str):
+        super().__init__(timeout=300)
+        self.cog, self.owner_id, self.channel_id = cog, owner_id, channel_id
+        self.title, self.description = title, description
+        self.start_utc, self.tz_name, self.date_text = start_utc, tz_name, date_text
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This sprint is being scheduled by someone else.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(
+        placeholder="How long is the sprint?",
+        options=[
+            discord.SelectOption(label="30 minutes", value="30"),
+            discord.SelectOption(label="1 hour", value="60"),
+            discord.SelectOption(label="1 hour 30 minutes", value="90"),
+            discord.SelectOption(label="2 hours", value="120"),
+        ]
+    )
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await self.cog._finalize_schedule(interaction, self, int(select.values[0]))
+
+
+class ScheduleAnotherView(SafeView):
+    def __init__(self, cog, owner_id: int, tz_name: str, prefill_date: str):
+        super().__init__(timeout=600)
+        self.cog, self.owner_id, self.tz_name, self.prefill_date = cog, owner_id, tz_name, prefill_date
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Run `/race schedule` to schedule your own.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="➕ Schedule another", style=discord.ButtonStyle.success)
+    async def again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ScheduleSprintModal(self.cog, self.tz_name, self.prefill_date))
+
+
+class ScheduledSprintView(SafeView):
+    """Persistent view on a scheduled sprint's announcement. Looked up by message id, so it survives
+    restarts. When the sprint goes live the same message is edited over to the regular JoinSprintView."""
+
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="🕯️ Pre-Join", style=discord.ButtonStyle.success, custom_id="sched_prejoin_btn", row=0)
+    async def prejoin_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = interaction.client.db
+        row = await db.get_scheduled_sprint_by_message(interaction.message.id)
+        if not row or row["status"] != "scheduled":
+            await interaction.response.send_message("❌ This sprint isn't open for pre-joining anymore.", ephemeral=True)
+            return
+        if await db.get_scheduled_participant(row["id"], interaction.user.id):
+            await interaction.response.send_message(
+                "You're already pre-joined — hit **Cancel Pre-Join** first if you need to change your book.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "How would you like to track your sprint?",
+            view=JoinTypeView(self.cog, scheduled_id=row["id"]), ephemeral=True
+        )
+
+    @discord.ui.button(label="🚪 Cancel Pre-Join", style=discord.ButtonStyle.danger, custom_id="sched_unjoin_btn", row=0)
+    async def unjoin_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = interaction.client.db
+        row = await db.get_scheduled_sprint_by_message(interaction.message.id)
+        if not row or row["status"] != "scheduled":
+            await interaction.response.send_message("❌ This sprint isn't open for pre-joining anymore.", ephemeral=True)
+            return
+        if not await db.delete_scheduled_participant(row["id"], interaction.user.id):
+            await interaction.response.send_message("You haven't pre-joined this sprint.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"🚪 {interaction.user.mention} left the pre-join list for **{row['title']}**.", ephemeral=False
+        )
+        await self.cog._update_scheduled_embed(interaction.guild, row["id"])
+
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Sprints(commands.Cog):
@@ -841,6 +1094,8 @@ class Sprints(commands.Cog):
         self._logging_sprints: dict[int, dict] = {}
         self._logging_tasks: dict[int, asyncio.Task] = {}
         self._end_message: dict[int, tuple[int, int]] = {}  # guild_id -> (channel_id, message_id)
+        self._tasks: set = set()                 # strong refs to background tasks so they aren't GC'd
+        self._restored = asyncio.Event()         # set once startup recovery has run (the scheduler waits on it)
 
     def _check_all_logged(self, guild_id: int):
         sprint = self._logging_sprints.get(guild_id)
@@ -855,58 +1110,125 @@ class Sprints(commands.Cog):
     async def cog_load(self):
         self.bot.add_view(JoinSprintView(self))
         self.bot.add_view(LogProgressView(self))
-        self.bot.loop.create_task(self._restore_sprints())
+        self.bot.add_view(ScheduledSprintView(self))
+        self._spawn(self._restore_sprints())
+        self.scheduler_tick.start()
+
+    def cog_unload(self):
+        self.scheduler_tick.cancel()
+
+    def _spawn(self, coro):
+        task = self.bot.loop.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def _restore_sprints(self):
-        await self.bot.wait_until_ready()
-        for guild in self.bot.guilds:
-            row = await self.bot.db.get_active_sprint(guild.id)
-            if not row:
-                continue
-            now = discord.utils.utcnow()
-            end_time = row["end_time"]
-            if end_time.tzinfo is None:
-                end_time = end_time.replace(tzinfo=timezone.utc)
-            start_time = row["start_time"]
-            if hasattr(start_time, "tzinfo") and start_time.tzinfo is None:
-                start_time = start_time.replace(tzinfo=timezone.utc)
+        try:
+            await self.bot.wait_until_ready()
+            for guild in self.bot.guilds:
+                row = await self.bot.db.get_active_sprint(guild.id)
+                if not row:
+                    continue
+                now = discord.utils.utcnow()
+                end_time = _aware(row["end_time"])
+                # The row's start_time is when the sprint was *created*; focus time began a join-window later,
+                # which is exactly end_time minus the duration.
+                start_time = end_time - timedelta(minutes=row["duration_minutes"])
 
-            participants = {}
-            for p in await self.bot.db.get_sprint_participants(guild.id):
-                end = _deserialize_end(p["type"], p["end_val"])
-                participants[p["user_id"]] = {
-                    "type": p["type"], "title": p["title"],
-                    "start": _deserialize_start(p["type"], p["start_val"]),
-                    "end": end,
-                    "joined_at": p.get("joined_at"),
-                    "gg_awarded": end is not None,
-                    "segments": _parse_segments(p.get("segments")),
-                    "left": p.get("resumed_at") is None,
+                participants = {}
+                for p in await self.bot.db.get_sprint_participants(guild.id):
+                    end = _deserialize_end(p["type"], p["end_val"])
+                    participants[p["user_id"]] = {
+                        "type": p["type"], "title": p["title"],
+                        "start": _deserialize_start(p["type"], p["start_val"]),
+                        "end": end,
+                        "joined_at": p.get("joined_at"),
+                        "gg_awarded": end is not None,
+                        "segments": _parse_segments(p.get("segments")),
+                        "total_minutes": p.get("total_minutes"),
+                        "left": p.get("resumed_at") is None,
+                    }
+                sprint = {
+                    "host": row["host_id"], "channel": row["channel_id"], "duration": row["duration_minutes"],
+                    "started_at": _aware(row["start_time"]), "start_time": start_time, "end_time": end_time,
+                    "role_id": row["role_id"], "participants": participants,
+                    "join_message_id": row.get("join_message_id"), "started": now >= start_time,
+                    "title": row.get("title"), "description": row.get("description"),
+                    "scheduled_id": row.get("scheduled_id"),
                 }
-            sprint = {
-                "host": row["host_id"], "channel": row["channel_id"], "duration": row["duration_minutes"],
-                "started_at": row["start_time"], "start_time": start_time, "end_time": end_time,
-                "role_id": row["role_id"], "participants": participants,
-                "join_message_id": row.get("join_message_id"), "started": now >= start_time,
-            }
-            active_sprints[guild.id] = sprint
-            remaining = (end_time - now).total_seconds()
-            self.bot.loop.create_task(self._wait_and_finish(guild, max(remaining, 0)))
+                active_sprints[guild.id] = sprint
+                self._spawn(self._run_sprint_lifecycle(guild, sprint))
+        finally:
+            self._restored.set()
 
-    async def _wait_and_finish(self, guild, seconds):
-        await asyncio.sleep(seconds)
-        await self._finish_sprint(guild)
+    # ── Sprint lifecycle (shared by /race start, scheduled sprints and restart recovery) ──────────
+
+    async def _announce_start(self, guild: discord.Guild, sprint: dict):
+        channel = await _get_channel(guild, sprint["channel"])
+        if not channel:
+            return
+        participant_ids = [uid for uid, d in sprint["participants"].items() if not d.get("left")]
+        mentions = " ".join(f"<@{uid}>" for uid in participant_ids) or None
+        title_line = f"**{sprint['title']}**\n" if sprint.get("title") else ""
+        end_time = sprint["end_time"]
+        start_embed = discord.Embed(
+            description=(
+                f"{_emoji(self.bot, 'litcandle')} **__Focus Time Started!__**\n{title_line}\n"
+                f"{_emoji(self.bot, 'griffinreading')} Griffin has lit the candle and commands all patrons "
+                f"to open their tomes, focus time has begun!\n\n"
+                f"{_emoji(self.bot, 'hourglass')} The sprint ends at "
+                f"{discord.utils.format_dt(end_time, 'F')} ({discord.utils.format_dt(end_time, 'R')})."
+            ),
+            color=RACE_COLOR
+        )
+        await channel.send(
+            content=mentions, embed=start_embed,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+    async def _run_sprint_lifecycle(self, guild: discord.Guild, sprint: dict):
+        """Waits for focus time, announces it, waits for the end, then finishes. After every wait it checks
+        this is still the guild's current sprint — otherwise a cancelled sprint's old timer would wake up
+        and finish whatever sprint had been started since."""
+        gid = guild.id
+        try:
+            if not sprint.get("started"):
+                delay = (sprint["start_time"] - discord.utils.utcnow()).total_seconds()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if active_sprints.get(gid) is not sprint:
+                    return
+                sprint["started"] = True
+                await self._announce_start(guild, sprint)
+            remaining = (sprint["end_time"] - discord.utils.utcnow()).total_seconds()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if active_sprints.get(gid) is not sprint:
+                return
+            await self._finish_sprint(guild)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            print(f"sprint lifecycle failed for guild {gid}:")
+            traceback.print_exc()
 
     # ── Roster embed (creation + live) ────────────────────────────────────────
 
     _FIELD_LIMIT = 1000
 
-    def _build_sprint_embeds(self, guild: discord.Guild, start_time, end_time, host_name, duration) -> list[discord.Embed]:
+    def _build_sprint_embeds(self, guild: discord.Guild, start_time, end_time, host_name, duration,
+                             title: str | None = None, description: str | None = None) -> list[discord.Embed]:
         sprint = active_sprints.get(guild.id)
         participants = sprint["participants"] if sprint else {}
 
+        head = [f"{_emoji(self.bot, 'announcement')} **__The Stacks Go Silent…__**"]
+        if title:
+            head.append(f"**{title}**")
+        if description:
+            head.append(description)
         lines = [
-            f"{_emoji(self.bot, 'announcement')} **__The Stacks Go Silent…__**",
+            *head,
             "",
             f"{_emoji(self.bot, 'litcandle')} **Start Time:** {discord.utils.format_dt(start_time, 'F')} "
             f"*({discord.utils.format_dt(start_time, 'R')})*",
@@ -957,7 +1279,10 @@ class Sprints(commands.Cog):
             msg = await channel.fetch_message(sprint["join_message_id"])
             host = guild.get_member(sprint["host"])
             host_name = host.display_name if host else "Unknown"
-            embeds = self._build_sprint_embeds(guild, start_time, end_time, host_name, sprint["duration"])
+            embeds = self._build_sprint_embeds(
+                guild, start_time, end_time, host_name, sprint["duration"],
+                title=sprint.get("title"), description=sprint.get("description")
+            )
             await msg.edit(embeds=embeds)
         except Exception:
             print(f"_update_join_embed failed for guild {guild.id}:")
@@ -1045,19 +1370,21 @@ class Sprints(commands.Cog):
             )
             return
 
-        manager_role_id = settings.get("sprint_manager_role_id")
-        griffin_manager_role_id = settings.get("griffin_manager_role_id")
-        if manager_role_id or griffin_manager_role_id:
-            user_role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
-            has_role = manager_role_id in user_role_ids or griffin_manager_role_id in user_role_ids
-            if not has_role and not interaction.user.guild_permissions.manage_guild:
-                await interaction.response.send_message(
-                    "❌ You don't have permission to start sprints.", ephemeral=True
-                )
-                return
+        if not _can_manage_sprints(interaction, settings):
+            await interaction.response.send_message(
+                "❌ You don't have permission to start sprints.", ephemeral=True
+            )
+            return
 
         if guild_id in active_sprints:
             await interaction.response.send_message("A sprint is already running!", ephemeral=True)
+            return
+        if guild_id in self._logging_sprints:
+            # The finishing sprint still owns this guild's active_sprint rows until its log window closes;
+            # starting another now would let the old sprint's cleanup wipe the new one's data.
+            await interaction.response.send_message(
+                "⏳ The last sprint is still collecting logs — try again in a few minutes.", ephemeral=True
+            )
             return
 
         role_id = settings.get("sprint_role_id")
@@ -1067,13 +1394,16 @@ class Sprints(commands.Cog):
         start_time = now + timedelta(seconds=countdown_seconds)
         end_time = start_time + timedelta(minutes=duration_minutes)
 
-        active_sprints[guild_id] = {
+        sprint = {
             "host": interaction.user.id, "channel": interaction.channel.id, "duration": duration_minutes,
             "started_at": now, "start_time": start_time, "end_time": end_time, "role_id": role_id,
             "participants": {}, "join_message_id": None, "started": False,
+            "title": None, "description": None, "scheduled_id": None,
         }
+        active_sprints[guild_id] = sprint
 
-        embeds = self._build_sprint_embeds(interaction.guild, start_time, end_time, interaction.user.display_name, duration_minutes)
+        embeds = self._build_sprint_embeds(interaction.guild, start_time, end_time,
+                                           interaction.user.display_name, duration_minutes)
         view = JoinSprintView(self)
 
         await interaction.response.send_message(
@@ -1082,37 +1412,14 @@ class Sprints(commands.Cog):
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
         msg = await interaction.original_response()
-        active_sprints[guild_id]["join_message_id"] = msg.id
+        sprint["join_message_id"] = msg.id
 
-        await self.bot.db.save_active_sprint(guild_id, interaction.user.id, interaction.channel.id, duration_minutes, now, end_time, role_id)
+        await self.bot.db.save_active_sprint(
+            guild_id, interaction.user.id, interaction.channel.id, duration_minutes, now, end_time, role_id
+        )
         await self.bot.db.update_sprint_message_id(guild_id, msg.id)
 
-        await asyncio.sleep(countdown_seconds)
-        if guild_id not in active_sprints:
-            return
-
-        active_sprints[guild_id]["started"] = True
-        channel = await _get_channel(interaction.guild, interaction.channel.id)
-        if channel:
-            participant_ids = [uid for uid, d in active_sprints.get(guild_id, {}).get("participants", {}).items() if not d.get("left")]
-            participant_mentions = " ".join(f"<@{uid}>" for uid in participant_ids) if participant_ids else None
-            start_embed = discord.Embed(
-                description=(
-                    f"{_emoji(self.bot, 'litcandle')} **__Focus Time Started!__**\n\n"
-                    f"{_emoji(self.bot, 'griffinreading')} Griffin has lit the candle and commands all patrons "
-                    f"to open their tomes, focus time has begun!\n\n"
-                    f"{_emoji(self.bot, 'hourglass')} The sprint ends at "
-                    f"{discord.utils.format_dt(end_time, 'F')} ({discord.utils.format_dt(end_time, 'R')})."
-                ),
-                color=RACE_COLOR
-            )
-            await channel.send(
-                content=participant_mentions, embed=start_embed,
-                allowed_mentions=discord.AllowedMentions(users=True),
-            )
-
-        await asyncio.sleep(duration_minutes * 60)
-        await self._finish_sprint(interaction.guild)
+        await self._run_sprint_lifecycle(interaction.guild, sprint)
 
     # ── /race cancel ──────────────────────────────────────────────────────────
 
@@ -1120,32 +1427,36 @@ class Sprints(commands.Cog):
     async def sprint_cancel(self, interaction: discord.Interaction):
         guild_id = interaction.guild.id
         settings = await self.bot.db.get_guild_config(guild_id)
-        manager_role_id = settings.get("sprint_manager_role_id")
-        griffin_manager_role_id = settings.get("griffin_manager_role_id")
-        if manager_role_id or griffin_manager_role_id:
-            user_role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
-            has_role = manager_role_id in user_role_ids or griffin_manager_role_id in user_role_ids
-            if not has_role and not interaction.user.guild_permissions.manage_guild:
-                await interaction.response.send_message(
-                    "❌ You don't have permission to cancel sprints.", ephemeral=True
-                )
-                return
+        if not _can_manage_sprints(interaction, settings):
+            await interaction.response.send_message(
+                "❌ You don't have permission to cancel sprints.", ephemeral=True
+            )
+            return
 
         cancelled_something = False
+        scheduled_ids = set()
 
-        if guild_id in active_sprints:
-            active_sprints.pop(guild_id, None)
+        sprint = active_sprints.pop(guild_id, None)
+        if sprint is not None:
             cancelled_something = True
+            if sprint.get("scheduled_id"):
+                scheduled_ids.add(sprint["scheduled_id"])
 
-        if guild_id in self._logging_sprints:
-            self._logging_sprints.pop(guild_id, None)
+        logging_sprint = self._logging_sprints.pop(guild_id, None)
+        if logging_sprint is not None:
+            # Flag it before waking the wait, so _finish_sprint knows to stop instead of posting results.
+            logging_sprint["cancelled"] = True
             self._end_message.pop(guild_id, None)
             task = self._logging_tasks.pop(guild_id, None)
             if task and not task.done():
                 task.cancel()
             cancelled_something = True
+            if logging_sprint.get("scheduled_id"):
+                scheduled_ids.add(logging_sprint["scheduled_id"])
 
         await self.bot.db.delete_active_sprint(guild_id)
+        for sid in scheduled_ids:
+            await self.bot.db.set_scheduled_status(sid, "cancelled")
 
         if cancelled_something:
             await interaction.response.send_message("🛑 The current sprint has been cancelled.")
@@ -1154,6 +1465,354 @@ class Sprints(commands.Cog):
                 "There's no sprint running right now, but I cleared any leftover state just in case.",
                 ephemeral=True
             )
+
+    # ── Scheduling ────────────────────────────────────────────────────────────────────────────
+
+    def _build_scheduled_embed(self, guild: discord.Guild, row: dict, prejoiners: list) -> discord.Embed:
+        start = _aware(row["start_time"])
+        end = start + timedelta(minutes=row["duration_minutes"])
+        host = guild.get_member(row["host_id"])
+        host_name = host.display_name if host else "Unknown"
+        lines = [f"{_emoji(self.bot, 'announcement')} **__Sprint Scheduled__**", f"**{row['title']}**"]
+        if row.get("description"):
+            lines.append(row["description"])
+        lines += [
+            "",
+            f"{_emoji(self.bot, 'griffinlurk')} **Host:** {host_name}",
+            f"{_emoji(self.bot, 'litcandle')} **Start Time:** {discord.utils.format_dt(start, 'F')} "
+            f"*({discord.utils.format_dt(start, 'R')})*",
+            f"{_emoji(self.bot, 'snuffedcandle')} **End Time:** {discord.utils.format_dt(end, 'F')} "
+            f"*({discord.utils.format_dt(end, 'R')})*",
+            f"{_emoji(self.bot, 'hourglass')} **Duration:** {_format_duration(row['duration_minutes'])}",
+            "",
+            f"*Joining opens {SCHEDULED_JOIN_MINUTES} minutes before focus time. Pre-join below to save your spot.*",
+        ]
+        embed = discord.Embed(description="\n".join(lines), color=RACE_COLOR)
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        bookmark = _emoji(self.bot, "bookmark")
+        p_lines = []
+        for p in prejoiners:
+            suffix = f" of **{p['title']}**" if p.get("title") else ""
+            if p["type"] == "audio_pct":
+                p_lines.append(f"{bookmark} <@{p['user_id']}> - {float(p['start_val']):.1f}%{suffix}")
+            else:
+                p_lines.append(f"{bookmark} <@{p['user_id']}> - page {p['start_val']}{suffix}")
+        _add_chunked_field(
+            embed, f"{_emoji(self.bot, 'blankbook')} Pre-Joined Patrons:", p_lines,
+            "No one yet — hit **Pre-Join** to save your spot!", limit=self._FIELD_LIMIT,
+        )
+        return embed
+
+    def _build_scheduled_closed_embed(self, row: dict, reason: str) -> discord.Embed:
+        start = _aware(row["start_time"])
+        label = "🛑 Cancelled" if reason == "cancelled" else "⚠️ Missed — Griffin was busy or offline"
+        return discord.Embed(
+            description=f"~~**{row['title']}**~~\n{label}\n*Was scheduled for {discord.utils.format_dt(start, 'F')}*",
+            color=RACE_COLOR,
+        )
+
+    async def _update_scheduled_embed(self, guild: discord.Guild, scheduled_id: int):
+        row = await self.bot.db.get_scheduled_sprint(scheduled_id)
+        if not row or not row.get("message_id") or row["status"] != "scheduled":
+            return
+        channel = await _get_channel(guild, row["channel_id"])
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(row["message_id"])
+            prejoiners = await self.bot.db.get_scheduled_participants(scheduled_id)
+            await msg.edit(embeds=[self._build_scheduled_embed(guild, row, prejoiners)])
+        except Exception:
+            print(f"_update_scheduled_embed failed for scheduled sprint {scheduled_id}:")
+            traceback.print_exc()
+
+    async def _close_scheduled_message(self, guild: discord.Guild, row: dict, reason: str):
+        if not row.get("message_id"):
+            return
+        channel = await _get_channel(guild, row["channel_id"])
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(row["message_id"])
+            await msg.edit(embeds=[self._build_scheduled_closed_embed(row, reason)], view=None)
+        except Exception:
+            print(f"_close_scheduled_message failed for scheduled sprint {row['id']}:")
+            traceback.print_exc()
+
+    async def _save_prejoin(self, interaction: discord.Interaction, scheduled_id: int, ptype: str,
+                            title: str | None, start_val: str, total_minutes: int | None = None) -> bool:
+        row = await self.bot.db.get_scheduled_sprint(scheduled_id)
+        if not row or row["status"] != "scheduled":
+            await interaction.response.send_message(
+                "❌ This sprint isn't open for pre-joining anymore.", ephemeral=True
+            )
+            return False
+        await self.bot.db.save_scheduled_participant(
+            scheduled_id, interaction.user.id, ptype, title, start_val, total_minutes
+        )
+        return True
+
+    async def _find_schedule_conflict(self, guild_id: int, start_utc, duration: int):
+        """Another scheduled/active sprint whose window — joining time before it through log time after
+        it — overlaps the proposed one. Sprints in a guild share state, so they can't overlap."""
+        join = timedelta(minutes=SCHEDULED_JOIN_MINUTES)
+        log = timedelta(minutes=LOG_WINDOW_MINUTES)
+        new_open, new_close = start_utc - join, start_utc + timedelta(minutes=duration) + log
+        for r in await self.bot.db.list_scheduled_sprints(guild_id, ("scheduled", "active")):
+            r_start = _aware(r["start_time"])
+            r_open, r_close = r_start - join, r_start + timedelta(minutes=r["duration_minutes"]) + log
+            if new_open < r_close and r_open < new_close:
+                return r
+        return None
+
+    async def _finalize_schedule(self, interaction: discord.Interaction, view: "ScheduleDurationView", duration: int):
+        guild, db = interaction.guild, self.bot.db
+        if view.start_utc <= discord.utils.utcnow() + timedelta(minutes=1):
+            await interaction.response.edit_message(
+                content="❌ That start time passed while you were choosing. Run `/race schedule` again.", view=None
+            )
+            return
+        conflict = await self._find_schedule_conflict(guild.id, view.start_utc, duration)
+        if conflict:
+            await interaction.response.edit_message(
+                content=(
+                    f"❌ That overlaps **{conflict['title']}** "
+                    f"({discord.utils.format_dt(_aware(conflict['start_time']), 'F')}). Sprints need "
+                    f"{SCHEDULED_JOIN_MINUTES} min of joining time before them and {LOG_WINDOW_MINUTES} min of "
+                    f"logging time after. Pick a shorter length, or run `/race schedule` with a different time."
+                ),
+                view=view,
+            )
+            return
+        channel = await _get_channel(guild, view.channel_id)
+        if not channel:
+            await interaction.response.edit_message(content="❌ I can't find that channel anymore.", view=None)
+            return
+        sid = await db.create_scheduled_sprint(
+            guild.id, channel.id, interaction.user.id, view.title, view.description, view.start_utc, duration
+        )
+        try:
+            row = await db.get_scheduled_sprint(sid)
+            msg = await channel.send(
+                embeds=[self._build_scheduled_embed(guild, row, [])], view=ScheduledSprintView(self)
+            )
+            await db.set_scheduled_message_id(sid, msg.id)
+        except Exception:
+            await db.set_scheduled_status(sid, "cancelled")
+            raise
+        await interaction.response.edit_message(
+            content=(f"✅ Scheduled **{view.title}** for {discord.utils.format_dt(view.start_utc, 'F')} "
+                     f"({_format_duration(duration)})."),
+            view=ScheduleAnotherView(self, interaction.user.id, view.tz_name, view.date_text),
+        )
+
+    @race.command(name="schedule", description="Schedule a sprint ahead of time (one at a time).")
+    async def sprint_schedule(self, interaction: discord.Interaction):
+        settings = await self.bot.db.get_guild_config(interaction.guild.id)
+        sprint_channel_id = settings.get("sprint_channel_id")
+        if sprint_channel_id and interaction.channel.id != sprint_channel_id:
+            await interaction.response.send_message(
+                f"❌ Sprints can only be scheduled in <#{sprint_channel_id}>.", ephemeral=True
+            )
+            return
+        if not _can_manage_sprints(interaction, settings):
+            await interaction.response.send_message(
+                "❌ You don't have permission to schedule sprints.", ephemeral=True
+            )
+            return
+        tz_name = settings.get("sprint_timezone")
+        if not tz_name:
+            await interaction.response.send_message(
+                "❌ Set the server's timezone first, so I know what \"14:30\" means: "
+                "`/staff race timezone` (e.g. `America/New_York`).", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(ScheduleSprintModal(self, tz_name))
+
+    @race.command(name="scheduled", description="See the upcoming scheduled sprints.")
+    async def sprint_scheduled(self, interaction: discord.Interaction):
+        db = self.bot.db
+        rows = await db.list_scheduled_sprints(interaction.guild.id, ("scheduled",))
+        if not rows:
+            await interaction.response.send_message("📜 Nothing is scheduled right now.")
+            return
+        lines = []
+        for r in rows:
+            start = _aware(r["start_time"])
+            count = len(await db.get_scheduled_participants(r["id"]))
+            link = (f" · [Pre-join]({_message_url(interaction.guild.id, r['channel_id'], r['message_id'])})"
+                    if r.get("message_id") else "")
+            lines.append(
+                f"**{r['title']}**\n{discord.utils.format_dt(start, 'F')} ({discord.utils.format_dt(start, 'R')}) · "
+                f"{_format_duration(r['duration_minutes'])} · {count} pre-joined{link}"
+            )
+        embeds = _paginate_lines(lines, "📜 Scheduled Sprints")
+        kwargs = {"view": EmbedPaginatorView(embeds)} if len(embeds) > 1 else {}   # response.send_message rejects view=None
+        await interaction.response.send_message(embed=embeds[0], **kwargs)
+
+    @race.command(name="unschedule", description="Cancel a scheduled sprint.")
+    @app_commands.describe(sprint="Which scheduled sprint to cancel")
+    async def sprint_unschedule(self, interaction: discord.Interaction, sprint: str):
+        db = self.bot.db
+        settings = await db.get_guild_config(interaction.guild.id)
+        if not _can_manage_sprints(interaction, settings):
+            await interaction.response.send_message(
+                "❌ You don't have permission to cancel scheduled sprints.", ephemeral=True
+            )
+            return
+        try:
+            sid = int(sprint)
+        except ValueError:
+            await interaction.response.send_message("❌ Pick a sprint from the list.", ephemeral=True)
+            return
+        row = await db.get_scheduled_sprint(sid)
+        if not row or row["guild_id"] != interaction.guild.id:
+            await interaction.response.send_message("❌ I couldn't find that scheduled sprint.", ephemeral=True)
+            return
+        if not await db.set_scheduled_status(sid, "cancelled", expected="scheduled"):
+            await interaction.response.send_message(
+                "❌ That sprint has already started or was already cancelled — use `/race cancel` for a running sprint.",
+                ephemeral=True
+            )
+            return
+        await self._close_scheduled_message(interaction.guild, row, "cancelled")
+        await interaction.response.send_message(
+            f"🛑 {interaction.user.mention} cancelled the scheduled sprint **{row['title']}**."
+        )
+
+    @sprint_unschedule.autocomplete("sprint")
+    async def _unschedule_autocomplete(self, interaction: discord.Interaction, current: str):
+        db = self.bot.db
+        settings = await db.get_guild_config(interaction.guild.id)
+        try:
+            tz = ZoneInfo(settings.get("sprint_timezone") or "UTC")
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = timezone.utc
+        out = []
+        for r in await db.list_scheduled_sprints(interaction.guild.id, ("scheduled",)):
+            local = _aware(r["start_time"]).astimezone(tz).strftime("%b %d %H:%M")
+            label = f"{r['title']} — {local}"[:100]
+            if current.lower() in label.lower():
+                out.append(app_commands.Choice(name=label, value=str(r["id"])))
+        return out[:25]
+
+    # The scheduler: opens a scheduled sprint's join window, converts pre-joiners to participants, and
+    # hands the sprint to the same lifecycle as /race start.
+
+    @tasks.loop(seconds=30)
+    async def scheduler_tick(self):
+        await self._scheduler_pass()
+
+    @scheduler_tick.before_loop
+    async def _before_scheduler_tick(self):
+        await self.bot.wait_until_ready()
+        await self._restored.wait()      # don't race startup recovery for ownership of a guild
+
+    async def _scheduler_pass(self):
+        cutoff = datetime.utcnow() + timedelta(minutes=SCHEDULED_JOIN_MINUTES)
+        for row in await self.bot.db.get_due_scheduled_sprints(cutoff):
+            try:
+                await self._try_activate_scheduled(row)
+            except Exception:
+                print(f"scheduled sprint {row['id']} failed to activate:")
+                traceback.print_exc()
+
+    async def _try_activate_scheduled(self, row: dict):
+        db = self.bot.db
+        guild = self.bot.get_guild(row["guild_id"])
+        channel = await _get_channel(guild, row["channel_id"]) if guild else None
+        if not guild or not channel:
+            await db.set_scheduled_status(row["id"], "missed", expected="scheduled")
+            return
+        if datetime.utcnow() >= row["start_time"]:
+            if await db.set_scheduled_status(row["id"], "missed", expected="scheduled"):
+                await self._post_missed(guild, channel, row)
+            return
+        if guild.id in active_sprints or guild.id in self._logging_sprints:
+            return                       # another sprint owns the guild right now — retry next pass
+        if not await db.set_scheduled_status(row["id"], "active", expected="scheduled"):
+            return                       # already claimed by another pass
+        try:
+            await self._activate_scheduled(guild, channel, row)
+        except Exception:
+            active_sprints.pop(guild.id, None)
+            await db.delete_active_sprint(guild.id)
+            await db.set_scheduled_status(row["id"], "missed")
+            raise
+
+    async def _post_missed(self, guild: discord.Guild, channel, row: dict):
+        settings = await self.bot.db.get_guild_config(guild.id)
+        librarian = settings.get("sprint_manager_role_id")
+        ping = f"<@&{librarian}> " if librarian else ""
+        await self._close_scheduled_message(guild, row, "missed")
+        await channel.send(
+            f"{ping}⚠️ **{row['title']}** was scheduled for "
+            f"{discord.utils.format_dt(_aware(row['start_time']), 'F')} but couldn't start — Griffin was busy or "
+            f"offline. Reschedule it with `/race schedule`.",
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+
+    async def _activate_scheduled(self, guild: discord.Guild, channel, row: dict):
+        db = self.bot.db
+        settings = await db.get_guild_config(guild.id)
+        role_id = settings.get("sprint_role_id")
+        start_time = _aware(row["start_time"])
+        end_time = start_time + timedelta(minutes=row["duration_minutes"])
+        now = discord.utils.utcnow()
+
+        prejoin_rows = await db.get_scheduled_participants(row["id"])
+        participants = {}
+        for p in prejoin_rows:
+            entry = {
+                "type": p["type"], "title": p["title"], "start": _deserialize_start(p["type"], p["start_val"]),
+                "end": None, "joined_at": row["start_time"], "gg_awarded": False, "segments": [],
+            }
+            if p.get("total_minutes"):
+                entry["total_minutes"] = p["total_minutes"]
+            participants[p["user_id"]] = entry
+
+        sprint = {
+            "host": row["host_id"], "channel": channel.id, "duration": row["duration_minutes"],
+            "started_at": now, "start_time": start_time, "end_time": end_time, "role_id": role_id,
+            "participants": participants, "join_message_id": row["message_id"], "started": False,
+            "title": row["title"], "description": row["description"], "scheduled_id": row["id"],
+        }
+        active_sprints[guild.id] = sprint        # claim the guild before any await below can be interleaved
+
+        await db.save_active_sprint(
+            guild.id, row["host_id"], channel.id, row["duration_minutes"], now, end_time, role_id,
+            title=row["title"], description=row["description"], scheduled_id=row["id"],
+            join_message_id=row["message_id"],
+        )
+        for p in prejoin_rows:
+            await db.save_sprint_participant(
+                guild.id, p["user_id"], p["type"], p["title"], p["start_val"],
+                joined_at=row["start_time"], total_minutes=p.get("total_minutes"),
+            )
+
+        host = guild.get_member(row["host_id"])
+        embeds = self._build_sprint_embeds(
+            guild, start_time, end_time, host.display_name if host else "Unknown", row["duration_minutes"],
+            title=row["title"], description=row["description"],
+        )
+        try:      # swap the Pre-Join message over to the live sprint in place
+            msg = await channel.fetch_message(row["message_id"])
+            await msg.edit(content=None, embeds=embeds, view=JoinSprintView(self))
+        except Exception:
+            msg = await channel.send(embeds=embeds, view=JoinSprintView(self))
+            sprint["join_message_id"] = msg.id
+            await db.update_sprint_message_id(guild.id, msg.id)
+
+        # Edits never notify, so the go-live ping is its own message.
+        mentions = ([f"<@&{role_id}>"] if role_id else []) + [f"<@{uid}>" for uid in participants]
+        notice = " ".join(mentions) + "\n" if mentions else ""
+        await channel.send(
+            f"{notice}{_emoji(self.bot, 'litcandle')} **{row['title']}** is open for joining — focus time starts "
+            f"{discord.utils.format_dt(start_time, 'R')}. [Jump to the sprint]({msg.jump_url})",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+        )
+        self._spawn(self._run_sprint_lifecycle(guild, sprint))
 
     # ── /race edit ────────────────────────────────────────────────────────────
 
@@ -1233,6 +1892,7 @@ class Sprints(commands.Cog):
                     "start": _deserialize_start(p["type"], p["start_val"]),
                     "end": _deserialize_end(p["type"], p["end_val"]),
                     "segments": _parse_segments(p.get("segments")),
+                    "total_minutes": p.get("total_minutes"),
                 }
 
         deadline = discord.utils.utcnow() + timedelta(minutes=LOG_WINDOW_MINUTES)
@@ -1266,6 +1926,8 @@ class Sprints(commands.Cog):
 
         self._logging_sprints.pop(guild_id, None)
         self._end_message.pop(guild_id, None)
+        if sprint.get("cancelled"):
+            return                       # /race cancel during the log window: don't post results
 
         sprint_end_time = discord.utils.utcnow()
 
@@ -1280,12 +1942,15 @@ class Sprints(commands.Cog):
                 "active_seconds": p.get("active_seconds") or 0,
                 "resumed_at": p.get("resumed_at"),
                 "segments": _parse_segments(p.get("segments")),
+                "total_minutes": p.get("total_minutes"),
             }
         for uid, data in sprint["participants"].items():
             if data["end"] is not None:
                 final_participants.setdefault(uid, data)
                 final_participants[uid]["end"] = data["end"]
                 final_participants[uid]["segments"] = data.get("segments", [])
+                if data.get("total_minutes"):
+                    final_participants[uid]["total_minutes"] = data["total_minutes"]
                 if data.get("joined_at") and not final_participants[uid].get("joined_at"):
                     final_participants[uid]["joined_at"] = data["joined_at"]
                 if data.get("gg_awarded"):
@@ -1334,7 +1999,10 @@ class Sprints(commands.Cog):
                 prefix = medals[i] if i < 3 else f"`#{i + 1}`"
                 dur = f" ({duration})" if duration else ""
                 lines.append(f"{prefix} **{name}** — +{pages} pages{suffix}{dur}")
-            embeds = _paginate_lines(lines, "🏁 Griffin has recorded the sprint results…")
+            embeds = _paginate_lines(
+                lines, "🏁 Griffin has recorded the sprint results…",
+                header=f"**{sprint['title']}**" if sprint.get("title") else None,
+            )
             if gg > 0:
                 for e in embeds:
                     e.set_footer(text=f"Each participant earned {gg} GG!")
@@ -1350,7 +2018,8 @@ class Sprints(commands.Cog):
             )
 
         sprint_id = await self.bot.db.create_sprint(
-            guild_id, sprint["channel"], sprint["host"], sprint["started_at"], sprint_end_time, sprint["duration"]
+            guild_id, sprint["channel"], sprint["host"], sprint["started_at"], sprint_end_time, sprint["duration"],
+            title=sprint.get("title"), is_scheduled=bool(sprint.get("scheduled_id")),
         )
         for uid, data in final_participants.items():
             if data["end"] is not None:
@@ -1363,6 +2032,9 @@ class Sprints(commands.Cog):
                 sprint_id, uid, start_val, end_val, "pages",
                 joined_at=data.get("joined_at"), sprint_end_time=sprint_end_time, title=title,
             )
+
+        if sprint.get("scheduled_id"):
+            await self.bot.db.set_scheduled_status(sprint["scheduled_id"], "done")
 
 
 # ── Sprint Edit Views ─────────────────────────────────────────────────────────

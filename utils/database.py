@@ -1,6 +1,7 @@
 import aiopg
 import json
 import os
+from datetime import timezone
 from typing import Optional
 
 DEFAULT_MESSAGE_RATE = 25
@@ -8,6 +9,14 @@ DEFAULT_MESSAGE_COOLDOWN = 30
 DEFAULT_VOICE_RATE = 25
 DEFAULT_VOICE_INTERVAL = 3600
 DEFAULT_SPRINT_GG = 50
+
+
+def _utc_naive(dt):
+    """Naive-UTC for TIMESTAMP columns. An aware datetime assigned to a TIMESTAMP column is converted
+    using the DB *session's* timezone, which is only UTC if the server happens to be — so normalise here."""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class Database:
@@ -159,6 +168,38 @@ class Database:
         await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS active_seconds INTEGER DEFAULT 0;")
         await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS resumed_at TIMESTAMP;")
         await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS segments TEXT;")
+        await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS total_minutes INTEGER;")
+        await self._execute("ALTER TABLE active_sprint ADD COLUMN IF NOT EXISTS title TEXT;")
+        await self._execute("ALTER TABLE active_sprint ADD COLUMN IF NOT EXISTS description TEXT;")
+        await self._execute("ALTER TABLE active_sprint ADD COLUMN IF NOT EXISTS scheduled_id INTEGER;")
+        await self._execute("ALTER TABLE sprints ADD COLUMN IF NOT EXISTS title TEXT;")
+        await self._execute("ALTER TABLE sprints ADD COLUMN IF NOT EXISTS is_scheduled BOOLEAN DEFAULT FALSE;")
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_sprints (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                channel_id BIGINT NOT NULL,
+                host_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                start_time TIMESTAMP NOT NULL,
+                duration_minutes INTEGER NOT NULL,
+                message_id BIGINT,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                created_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')
+            )
+        """)
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_sprint_participants (
+                scheduled_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
+                type TEXT NOT NULL,
+                title TEXT,
+                start_val TEXT NOT NULL,
+                total_minutes INTEGER,
+                PRIMARY KEY (scheduled_id, user_id)
+            )
+        """)
         await self._execute("""
             CREATE TABLE IF NOT EXISTS sprint_book_meta (
                 user_id BIGINT NOT NULL,
@@ -422,11 +463,13 @@ class Database:
     # --- sprints ---
 
     async def create_sprint(self, guild_id: int, channel_id: int, host_id: int,
-                             start_time, end_time, duration_minutes: int) -> int:
+                             start_time, end_time, duration_minutes: int,
+                             title: Optional[str] = None, is_scheduled: bool = False) -> int:
         row = await self._fetchone("""
-            INSERT INTO sprints (guild_id, channel_id, host_id, start_time, end_time, duration_minutes)
-            VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
-        """, guild_id, channel_id, host_id, start_time, end_time, duration_minutes)
+            INSERT INTO sprints (guild_id, channel_id, host_id, start_time, end_time, duration_minutes, title, is_scheduled)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+        """, guild_id, channel_id, host_id, _utc_naive(start_time), _utc_naive(end_time),
+             duration_minutes, title, is_scheduled)
         return row["id"]
 
     async def add_sprint_participant(self, sprint_id: int, user_id: int, start_count: int, end_count,
@@ -434,7 +477,8 @@ class Database:
         await self._execute(
             "INSERT INTO sprint_participants (sprint_id, user_id, start_count, end_count, type, joined_at, sprint_end_time, title) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-            sprint_id, user_id, start_count, end_count, ptype, joined_at, sprint_end_time, title
+            sprint_id, user_id, start_count, end_count, ptype,
+            _utc_naive(joined_at), _utc_naive(sprint_end_time), title
         )
 
     async def get_sprint_logs(self, guild_id: int, user_id: int, limit: int = 10) -> list:
@@ -534,12 +578,16 @@ class Database:
 
     # --- active sprint persistence ---
 
-    async def save_active_sprint(self, guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id):
+    async def save_active_sprint(self, guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id,
+                                  title=None, description=None, scheduled_id=None, join_message_id=None):
         await self._execute("DELETE FROM active_sprint WHERE guild_id=%s", guild_id)
         await self._execute("""
-            INSERT INTO active_sprint (guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id)
+            INSERT INTO active_sprint
+                (guild_id, host_id, channel_id, duration_minutes, start_time, end_time, role_id,
+                 title, description, scheduled_id, join_message_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, guild_id, host_id, channel_id, duration_minutes, _utc_naive(start_time), _utc_naive(end_time),
+             role_id, title, description, scheduled_id, join_message_id)
 
     async def update_sprint_message_id(self, guild_id, message_id):
         await self._execute(
@@ -554,20 +602,21 @@ class Database:
         await self._execute("DELETE FROM active_sprint WHERE guild_id=%s", guild_id)
         await self._execute("DELETE FROM active_sprint_participants WHERE guild_id=%s", guild_id)
 
-    async def save_sprint_participant(self, guild_id, user_id, ptype, title, start_val, end_val=None, joined_at=None):
-        """Starts (or restarts, e.g. after switching books) a fresh active-time clock."""
+    async def save_sprint_participant(self, guild_id, user_id, ptype, title, start_val, end_val=None, joined_at=None,
+                                       total_minutes=None):
+        """Starts (or restarts, e.g. after starting fresh with a new book) a fresh active-time clock."""
         from datetime import datetime
-        joined_at = joined_at or datetime.utcnow()
+        joined_at = _utc_naive(joined_at) or datetime.utcnow()
         await self._execute("""
             INSERT INTO active_sprint_participants
-                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s)
+                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at, total_minutes)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s,%s)
             ON CONFLICT (guild_id, user_id) DO UPDATE SET
                 type=%s, title=%s, start_val=%s, end_val=%s,
                 joined_at=COALESCE(active_sprint_participants.joined_at, %s),
-                active_seconds=0, resumed_at=%s
-        """, guild_id, user_id, ptype, title, start_val, end_val, joined_at, joined_at,
-             ptype, title, start_val, end_val, joined_at, joined_at)
+                active_seconds=0, resumed_at=%s, total_minutes=%s
+        """, guild_id, user_id, ptype, title, start_val, end_val, joined_at, joined_at, total_minutes,
+             ptype, title, start_val, end_val, joined_at, joined_at, total_minutes)
 
     async def update_sprint_participant_end(self, guild_id, user_id, end_val):
         await self._execute(
@@ -597,19 +646,91 @@ class Database:
         """, guild_id, user_id)
 
     async def switch_sprint_participant_book(self, guild_id, user_id, ptype, title, start_val,
-                                              segments_json: str, joined_at=None):
+                                              segments_json: str, joined_at=None, total_minutes=None):
         """Starts a participant's next book in one statement: new leg + saved segments together,
         leaving the active-time clock (joined_at / active_seconds / resumed_at) untouched."""
         from datetime import datetime
-        joined_at = joined_at or datetime.utcnow()
+        joined_at = _utc_naive(joined_at) or datetime.utcnow()
         await self._execute("""
             INSERT INTO active_sprint_participants
-                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at, segments)
-            VALUES (%s,%s,%s,%s,%s,NULL,%s,0,%s,%s)
+                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at,
+                 segments, total_minutes)
+            VALUES (%s,%s,%s,%s,%s,NULL,%s,0,%s,%s,%s)
             ON CONFLICT (guild_id, user_id) DO UPDATE SET
                 type=EXCLUDED.type, title=EXCLUDED.title, start_val=EXCLUDED.start_val,
-                end_val=NULL, segments=EXCLUDED.segments
-        """, guild_id, user_id, ptype, title, start_val, joined_at, joined_at, segments_json)
+                end_val=NULL, segments=EXCLUDED.segments, total_minutes=EXCLUDED.total_minutes
+        """, guild_id, user_id, ptype, title, start_val, joined_at, joined_at, segments_json, total_minutes)
+
+    # --- scheduled sprints ---------------------------------------------------------------
+    # start_time is naive UTC. status: scheduled -> active -> done, or cancelled / missed.
+
+    async def create_scheduled_sprint(self, guild_id, channel_id, host_id, title, description,
+                                       start_time, duration_minutes) -> int:
+        row = await self._fetchone("""
+            INSERT INTO scheduled_sprints (guild_id, channel_id, host_id, title, description, start_time, duration_minutes)
+            VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+        """, guild_id, channel_id, host_id, title, description, _utc_naive(start_time), duration_minutes)
+        return row["id"]
+
+    async def set_scheduled_message_id(self, scheduled_id: int, message_id: int):
+        await self._execute("UPDATE scheduled_sprints SET message_id=%s WHERE id=%s", message_id, scheduled_id)
+
+    async def get_scheduled_sprint(self, scheduled_id: int) -> Optional[dict]:
+        return await self._fetchone("SELECT * FROM scheduled_sprints WHERE id=%s", scheduled_id)
+
+    async def get_scheduled_sprint_by_message(self, message_id: int) -> Optional[dict]:
+        return await self._fetchone("SELECT * FROM scheduled_sprints WHERE message_id=%s", message_id)
+
+    async def list_scheduled_sprints(self, guild_id: int, statuses=("scheduled",)) -> list:
+        return await self._fetchall("""
+            SELECT * FROM scheduled_sprints
+            WHERE guild_id=%s AND status = ANY(%s)
+            ORDER BY start_time ASC, id ASC
+        """, guild_id, list(statuses))
+
+    async def get_due_scheduled_sprints(self, cutoff) -> list:
+        """Still-scheduled sprints whose start falls on/before `cutoff` (i.e. whose join window has opened)."""
+        return await self._fetchall("""
+            SELECT * FROM scheduled_sprints
+            WHERE status='scheduled' AND start_time <= %s
+            ORDER BY start_time ASC, id ASC
+        """, _utc_naive(cutoff))
+
+    async def set_scheduled_status(self, scheduled_id: int, status: str, expected: Optional[str] = None) -> bool:
+        """Moves a scheduled sprint to `status`. With `expected`, only if it's currently in that state — a
+        compare-and-set, so two activations/cancellations can never both win. True if a row changed."""
+        if expected is None:
+            row = await self._fetchone(
+                "UPDATE scheduled_sprints SET status=%s WHERE id=%s RETURNING id", status, scheduled_id)
+        else:
+            row = await self._fetchone(
+                "UPDATE scheduled_sprints SET status=%s WHERE id=%s AND status=%s RETURNING id",
+                status, scheduled_id, expected)
+        return row is not None
+
+    async def save_scheduled_participant(self, scheduled_id, user_id, ptype, title, start_val, total_minutes=None):
+        await self._execute("""
+            INSERT INTO scheduled_sprint_participants (scheduled_id, user_id, type, title, start_val, total_minutes)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (scheduled_id, user_id) DO UPDATE SET
+                type=EXCLUDED.type, title=EXCLUDED.title, start_val=EXCLUDED.start_val,
+                total_minutes=EXCLUDED.total_minutes
+        """, scheduled_id, user_id, ptype, title, start_val, total_minutes)
+
+    async def delete_scheduled_participant(self, scheduled_id: int, user_id: int) -> bool:
+        row = await self._fetchone(
+            "DELETE FROM scheduled_sprint_participants WHERE scheduled_id=%s AND user_id=%s RETURNING user_id",
+            scheduled_id, user_id)
+        return row is not None
+
+    async def get_scheduled_participant(self, scheduled_id: int, user_id: int) -> Optional[dict]:
+        return await self._fetchone(
+            "SELECT * FROM scheduled_sprint_participants WHERE scheduled_id=%s AND user_id=%s",
+            scheduled_id, user_id)
+
+    async def get_scheduled_participants(self, scheduled_id: int) -> list:
+        return await self._fetchall(
+            "SELECT * FROM scheduled_sprint_participants WHERE scheduled_id=%s ORDER BY user_id", scheduled_id)
 
     async def get_sprint_participants(self, guild_id) -> list:
         return await self._fetchall("SELECT * FROM active_sprint_participants WHERE guild_id=%s", guild_id)
