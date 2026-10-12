@@ -12,6 +12,7 @@ from cogs.economy import _award_gg
 from utils.emojis import emoji as _emoji
 
 LOG_WINDOW_MINUTES = 7
+TEST_SPRINT_MINUTES = 5         # "Mod Test": sprint managers only, never awards (or deducts) GG
 SCHEDULED_JOIN_MINUTES = 5   # joining window before a scheduled sprint's focus time
 RACE_COLOR = discord.Color(0x26878D)
 
@@ -47,6 +48,13 @@ def _format_duration(minutes: int) -> str:
 async def _sprint_gg(db, guild_id: int) -> int:
     """GG awarded per completed sprint in this guild (0 = off). Set with /gg setrate sprint."""
     return (await db.get_guild_config(guild_id))["sprint_gg"]
+
+
+async def _gg_for_duration(db, guild_id: int, duration) -> int:
+    """GG for a sprint of this length: nothing for the Mod Test length, the guild's rate otherwise."""
+    if duration == TEST_SPRINT_MINUTES:
+        return 0
+    return await _sprint_gg(db, guild_id)
 
 
 async def _award_sprint_gg(bot, guild: discord.Guild, user_id: int, amount: int):
@@ -131,6 +139,14 @@ def _can_manage_sprints(interaction: discord.Interaction, settings: dict) -> boo
         return True
     user_roles = {r.id for r in getattr(interaction.user, "roles", [])}
     return (race_role in user_roles or griffin_role in user_roles
+            or interaction.user.guild_permissions.manage_guild)
+
+
+def _is_sprint_manager(interaction: discord.Interaction, settings: dict) -> bool:
+    """Like _can_manage_sprints but never open-to-all: needs a configured role or Manage Server."""
+    user_roles = {r.id for r in getattr(interaction.user, "roles", [])}
+    return (settings.get("sprint_manager_role_id") in user_roles
+            or settings.get("griffin_manager_role_id") in user_roles
             or interaction.user.guild_permissions.manage_guild)
 
 
@@ -645,7 +661,7 @@ class LogPagesModal(SafeModal, title="Log Sprint — Pages"):
         data["gg_awarded"] = True
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end))
         self.cog._check_all_logged(guild_id)
-        gg = await _sprint_gg(interaction.client.db, guild_id)
+        gg = await _gg_for_duration(interaction.client.db, guild_id, sprint["duration"])
         await _award_sprint_gg(interaction.client, interaction.guild, uid, gg)
         _, total_pages = _combined_title_and_pages(data, end)
         gg_note = f" — **{gg} GG** earned!" if gg > 0 else "!"
@@ -682,7 +698,7 @@ class LogAudioPctModal(SafeModal, title="Log Sprint — Audio %"):
         data["end"] = end_pct
         data["gg_awarded"] = True
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end_pct))
-        gg = await _sprint_gg(interaction.client.db, guild_id)
+        gg = await _gg_for_duration(interaction.client.db, guild_id, sprint["duration"])
         await _award_sprint_gg(interaction.client, interaction.guild, uid, gg)
         self.cog._check_all_logged(guild_id)
         _, total_pages = _combined_title_and_pages(data, end_pct)
@@ -1431,6 +1447,8 @@ class Sprints(commands.Cog):
             f"{_emoji(self.bot, 'hourglass')} **Duration:** {_format_duration(duration)}",
             f"{_emoji(self.bot, 'griffinlurk')} **Host:** {host_name}",
         ]
+        if duration == TEST_SPRINT_MINUTES:
+            lines.append("🧪 **Mod Test sprint — no GG is awarded.**")
         main_embed = discord.Embed(description="\n".join(lines), color=RACE_COLOR)
 
         server_icon = guild.icon.url if guild.icon else None
@@ -1543,6 +1561,7 @@ class Sprints(commands.Cog):
         app_commands.Choice(name="1 hour", value=60),
         app_commands.Choice(name="1 hour 30 minutes", value=90),
         app_commands.Choice(name="2 hours", value=120),
+        app_commands.Choice(name="Mod Test (5 min, no GG)", value=TEST_SPRINT_MINUTES),
     ])
     @app_commands.choices(countdown_seconds=[
         app_commands.Choice(name="3 minutes", value=180),
@@ -1567,6 +1586,12 @@ class Sprints(commands.Cog):
         if not _can_manage_sprints(interaction, settings):
             await interaction.response.send_message(
                 "❌ You don't have permission to start sprints.", ephemeral=True
+            )
+            return
+
+        if duration_minutes == TEST_SPRINT_MINUTES and not _is_sprint_manager(interaction, settings):
+            await interaction.response.send_message(
+                "❌ Mod Test sprints are for sprint managers only.", ephemeral=True
             )
             return
 
@@ -2061,7 +2086,7 @@ class Sprints(commands.Cog):
         member = member or interaction.user
         stats = await self.bot.db.get_sprint_stats(interaction.guild.id, member.id)
         gg_rate = await _sprint_gg(self.bot.db, interaction.guild.id)
-        gg_earned = (stats["sprints_completed"] or 0) * gg_rate
+        gg_earned = (stats["gg_sprints"] or 0) * gg_rate
         pages = stats["total_pages"] or 0
         unlogged = int(stats["unlogged_sprints"] or 0)
 
@@ -2093,7 +2118,7 @@ class Sprints(commands.Cog):
             name = _safe_name(member, row["user_id"])
             sprints = row["sprints_completed"] or 0
             total_pages = row["total_pages"] or 0
-            gg_part = f" · Total Sprint GG Earned: {sprints * gg_rate:,} GG" if gg_rate > 0 else ""
+            gg_part = f" · Total Sprint GG Earned: {(row['gg_sprints'] or 0) * gg_rate:,} GG" if gg_rate > 0 else ""
             lines.append(
                 f"**{ordinals[i]} - {name.upper()}**\n"
                 f"{sprints} Sprint{'s' if sprints != 1 else ''} | "
@@ -2185,7 +2210,7 @@ class Sprints(commands.Cog):
 
         await self.bot.db.delete_active_sprint(guild_id)
 
-        gg = await _sprint_gg(self.bot.db, guild_id)
+        gg = await _gg_for_duration(self.bot.db, guild_id, sprint["duration"])
         silent_gg_uids = []
         for uid, data in final_participants.items():
             if data["end"] is not None and not data.get("gg_awarded"):
@@ -2299,16 +2324,17 @@ class SprintEditModal(SafeModal):
 
 
 class SprintDeleteConfirmView(SafeView):
-    def __init__(self, bot, sprint_id: int, guild_id: int):
+    def __init__(self, bot, sprint_id: int, guild_id: int, is_test: bool = False):
         super().__init__(timeout=30)
         self.bot = bot
         self.sprint_id = sprint_id
         self.guild_id = guild_id
+        self.is_test = is_test
 
     @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.bot.db.delete_sprint_log(self.sprint_id, interaction.user.id)
-        gg = await _sprint_gg(self.bot.db, self.guild_id)
+        gg = 0 if self.is_test else await _sprint_gg(self.bot.db, self.guild_id)
         if gg > 0:
             await self.bot.db.remove_gg(self.guild_id, interaction.user.id, gg)
         for item in self.children:
@@ -2370,11 +2396,12 @@ class SprintLogSelectView(SafeView):
     async def _on_delete(self, interaction: discord.Interaction):
         row = self.logs[self._selected]
         date = row["sprint_end_time"].strftime("%b %d") if row["sprint_end_time"] else "?"
-        gg = await _sprint_gg(self.bot.db, self.guild_id)
+        is_test = row["duration_minutes"] == TEST_SPRINT_MINUTES
+        gg = 0 if is_test else await _sprint_gg(self.bot.db, self.guild_id)
         deduct_note = f" This will deduct **{gg} GG**." if gg > 0 else ""
         await interaction.response.send_message(
             f"Delete **{row['title'] or 'Untitled'}** ({date})?{deduct_note}",
-            view=SprintDeleteConfirmView(self.bot, row["sprint_id"], self.guild_id),
+            view=SprintDeleteConfirmView(self.bot, row["sprint_id"], self.guild_id, is_test),
             ephemeral=True,
         )
 

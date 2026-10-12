@@ -501,7 +501,7 @@ class Database:
 
     async def get_sprint_logs(self, guild_id: int, user_id: int, limit: int = 10) -> list:
         return await self._fetchall("""
-            SELECT sp.sprint_id, sp.title, sp.type, sp.start_count, sp.end_count, sp.sprint_end_time
+            SELECT sp.sprint_id, sp.title, sp.type, sp.start_count, sp.end_count, sp.sprint_end_time, s.duration_minutes
             FROM sprint_participants sp
             JOIN sprints s ON s.id = sp.sprint_id
             WHERE s.guild_id=%s AND sp.user_id=%s AND sp.end_count IS NOT NULL
@@ -524,6 +524,7 @@ class Database:
     async def get_sprint_stats(self, guild_id: int, user_id: int) -> dict:
         return await self._fetchone("""
             SELECT COUNT(*) FILTER (WHERE sp.end_count IS NOT NULL) AS sprints_completed,
+                   COUNT(*) FILTER (WHERE sp.end_count IS NOT NULL AND s.duration_minutes <> 5) AS gg_sprints,
                    COALESCE(SUM(CASE WHEN sp.type='pages' AND sp.end_count IS NOT NULL THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_pages,
                    COALESCE(SUM(CASE WHEN sp.type='audio' AND sp.end_count IS NOT NULL THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_audio_minutes,
                    COUNT(*) FILTER (WHERE sp.end_count IS NULL) AS unlogged_sprints
@@ -584,6 +585,7 @@ class Database:
         return await self._fetchall("""
             SELECT sp.user_id,
                    COUNT(*) AS sprints_completed,
+                   COUNT(*) FILTER (WHERE s.duration_minutes <> 5) AS gg_sprints,
                    COALESCE(SUM(CASE WHEN sp.type='pages' THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_pages,
                    COALESCE(SUM(CASE WHEN sp.type='audio' THEN (sp.end_count - sp.start_count) ELSE 0 END), 0) AS total_audio_minutes
             FROM sprint_participants sp
