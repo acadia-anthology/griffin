@@ -759,7 +759,7 @@ class StaffGroup(GriffinModGroup):
                 "like `14:30` (your own timezone, asked once) or a countdown like `in 1h30m`",
                 "**/race unschedule** `<sprint>` — Cancel a scheduled sprint",
                 "**/race cancel** — Force-cancel the sprint that's running or collecting logs",
-                "**/race start** `Mod Test (5 min, no GG)` — A short practice sprint for testing; never awards GG",
+                "**/race start** `Mod Test (5 min, no GG)` — A 5-minute practice sprint for testing (also offered in `/race schedule`); never awards GG",
                 "**/staff race ping-role** `<role>` — Set the role pinged when a sprint starts",
                 "**/staff race librarian-role** `<role>` — Set who can manage sprints and gets "
                 "pinged with results",

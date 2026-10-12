@@ -1109,9 +1109,11 @@ class ScheduleSprintModal(SafeModal, title="Schedule a Sprint"):
                 f"❌ That start time is already past (or less than a minute away).{hint}", ephemeral=True
             )
             return
+        settings = await self.cog.bot.db.get_guild_config(interaction.guild.id)
         view = ScheduleDurationView(
             self.cog, interaction.user.id, interaction.channel.id, title,
             (self.blurb.value or "").strip() or None, start_utc, self.tz_name, date_text,
+            allow_test=_is_sprint_manager(interaction, settings),
         )
         await interaction.response.send_message(
             f"⏱️ How long should **{title}** run?\n"
@@ -1213,8 +1215,10 @@ class TimezonePickView(SafeView):
 
 class ScheduleDurationView(SafeView):
     def __init__(self, cog, owner_id: int, channel_id: int, title: str, description: str | None,
-                 start_utc, tz_name: str, date_text: str):
+                 start_utc, tz_name: str, date_text: str, allow_test: bool = False):
         super().__init__(timeout=300)
+        if allow_test:                  # only offered to sprint managers; _finalize_schedule re-checks
+            self.pick.add_option(label="Mod Test (5 min, no GG)", value=str(TEST_SPRINT_MINUTES))
         self.cog, self.owner_id, self.channel_id = cog, owner_id, channel_id
         self.title, self.description = title, description
         self.start_utc, self.tz_name, self.date_text = start_utc, tz_name, date_text
@@ -1703,6 +1707,7 @@ class Sprints(commands.Cog):
             f"{_emoji(self.bot, 'snuffedcandle')} **End Time:** {discord.utils.format_dt(end, 'F')} "
             f"*({discord.utils.format_dt(end, 'R')})*",
             f"{_emoji(self.bot, 'hourglass')} **Duration:** {_format_duration(row['duration_minutes'])}",
+            *(["🧪 **Mod Test sprint — no GG is awarded.**"] if row["duration_minutes"] == TEST_SPRINT_MINUTES else []),
             "",
             f"*Joining opens {SCHEDULED_JOIN_MINUTES} minutes before focus time. Pre-join below to save your spot.*",
         ]
@@ -1790,6 +1795,11 @@ class Sprints(commands.Cog):
         if view.start_utc <= discord.utils.utcnow() + timedelta(minutes=1):
             await interaction.response.edit_message(
                 content="❌ That start time passed while you were choosing. Run `/race schedule` again.", view=None
+            )
+            return
+        if duration == TEST_SPRINT_MINUTES and not _is_sprint_manager(interaction, await db.get_guild_config(guild.id)):
+            await interaction.response.edit_message(
+                content="❌ Mod Test sprints are for sprint managers only.", view=None
             )
             return
         conflict = await self._find_schedule_conflict(guild.id, view.start_utc, duration)
