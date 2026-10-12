@@ -7,6 +7,7 @@ DEFAULT_MESSAGE_RATE = 25
 DEFAULT_MESSAGE_COOLDOWN = 30
 DEFAULT_VOICE_RATE = 25
 DEFAULT_VOICE_INTERVAL = 3600
+DEFAULT_SPRINT_GG = 50
 
 
 class Database:
@@ -90,6 +91,7 @@ class Database:
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS griffin_manager_role_id BIGINT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS level_thresholds TEXT;")
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS level_flat_rate INTEGER;")
+        await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_gg INTEGER;")
 
         await self._execute("""
             CREATE TABLE IF NOT EXISTS level_tier_roles (
@@ -272,11 +274,14 @@ class Database:
             "SELECT message_rate, message_cooldown, voice_rate, voice_interval, "
             "levelup_channel_id, assets_channel_id, sprint_channel_id, sprint_role_id, "
             "sprint_manager_role_id, sprint_timezone, griffin_manager_role_id, "
-            "level_thresholds, level_flat_rate "
+            "level_thresholds, level_flat_rate, sprint_gg "
             "FROM guild_config WHERE guild_id = %s",
             guild_id
         )
         if row:
+            # NULL means "never configured" -> the default; an explicit 0 must stay 0 (GG off).
+            if row.get("sprint_gg") is None:
+                row["sprint_gg"] = DEFAULT_SPRINT_GG
             return row
         return {
             "message_rate": DEFAULT_MESSAGE_RATE,
@@ -292,6 +297,7 @@ class Database:
             "griffin_manager_role_id": None,
             "level_thresholds": None,
             "level_flat_rate": None,
+            "sprint_gg": DEFAULT_SPRINT_GG,
         }
 
     async def set_levelup_channel(self, guild_id: int, channel_id: int):
@@ -356,6 +362,15 @@ class Database:
             ON CONFLICT (guild_id)
             DO UPDATE SET level_thresholds = %s
         """, guild_id, payload, payload)
+
+    async def set_sprint_gg(self, guild_id: int, amount: int):
+        """GG awarded per completed sprint; 0 turns it off. NULL (never set) means the default."""
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, sprint_gg)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET sprint_gg = %s
+        """, guild_id, amount, amount)
 
     async def set_level_flat_rate(self, guild_id: int, rate: int):
         await self._execute("""
@@ -560,18 +575,15 @@ class Database:
             end_val, guild_id, user_id
         )
 
-    async def update_sprint_participant_segments(self, guild_id, user_id, segments_json: str):
-        """Persists completed Switch Books legs so they survive a bot restart mid-sprint."""
-        await self._execute(
-            "UPDATE active_sprint_participants SET segments=%s WHERE guild_id=%s AND user_id=%s",
-            segments_json, guild_id, user_id
-        )
-
+    # resumed_at / joined_at are naive-UTC (Python's datetime.utcnow()), so the clock queries
+    # below compare against NOW() AT TIME ZONE 'UTC' rather than bare NOW(), which would be
+    # read in whatever timezone the database server happens to run in.
     async def leave_sprint_participant(self, guild_id, user_id):
         """Banks elapsed active time and pauses the clock."""
         await self._execute("""
             UPDATE active_sprint_participants
-            SET active_seconds = active_seconds + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - resumed_at))::INTEGER),
+            SET active_seconds = active_seconds
+                    + GREATEST(0, EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - resumed_at))::INTEGER),
                 resumed_at = NULL
             WHERE guild_id=%s AND user_id=%s AND resumed_at IS NOT NULL
         """, guild_id, user_id)
@@ -580,9 +592,24 @@ class Database:
         """Resumes a paused clock without touching progress/title."""
         await self._execute("""
             UPDATE active_sprint_participants
-            SET resumed_at = NOW()
+            SET resumed_at = (NOW() AT TIME ZONE 'UTC')
             WHERE guild_id=%s AND user_id=%s AND resumed_at IS NULL
         """, guild_id, user_id)
+
+    async def switch_sprint_participant_book(self, guild_id, user_id, ptype, title, start_val,
+                                              segments_json: str, joined_at=None):
+        """Starts a participant's next book in one statement: new leg + saved segments together,
+        leaving the active-time clock (joined_at / active_seconds / resumed_at) untouched."""
+        from datetime import datetime
+        joined_at = joined_at or datetime.utcnow()
+        await self._execute("""
+            INSERT INTO active_sprint_participants
+                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at, segments)
+            VALUES (%s,%s,%s,%s,%s,NULL,%s,0,%s,%s)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                type=EXCLUDED.type, title=EXCLUDED.title, start_val=EXCLUDED.start_val,
+                end_val=NULL, segments=EXCLUDED.segments
+        """, guild_id, user_id, ptype, title, start_val, joined_at, joined_at, segments_json)
 
     async def get_sprint_participants(self, guild_id) -> list:
         return await self._fetchall("SELECT * FROM active_sprint_participants WHERE guild_id=%s", guild_id)

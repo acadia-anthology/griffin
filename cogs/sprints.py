@@ -9,7 +9,6 @@ import traceback
 from cogs.economy import _award_gg
 from utils.emojis import emoji as _emoji
 
-SPRINT_GG = 50
 LOG_WINDOW_MINUTES = 7
 RACE_COLOR = discord.Color(0x26878D)
 
@@ -42,12 +41,48 @@ def _format_duration(minutes: int) -> str:
     return f"{m} minutes"
 
 
+async def _sprint_gg(db, guild_id: int) -> int:
+    """GG awarded per completed sprint in this guild (0 = off). Set with /gg setrate sprint."""
+    return (await db.get_guild_config(guild_id))["sprint_gg"]
+
+
 async def _award_sprint_gg(bot, guild: discord.Guild, user_id: int, amount: int):
+    if amount <= 0:
+        return
     member = guild.get_member(user_id)
     if member:
         await _award_gg(bot.db, guild, member, amount)
     else:
         await bot.db.add_gg(guild.id, user_id, amount)
+
+
+_ZWSP = "​"
+
+
+def _add_chunked_field(embed: discord.Embed, header: str, lines: list[str], empty_text: str,
+                       limit: int = 1000, budget: int = 4500) -> None:
+    """Lists `lines` across as many fields as needed. Discord rejects a field over 1024 chars and an
+    embed over 6000, and a rejected send/edit means the message silently never updates — so keep every
+    field under `limit`, and if a huge group would blow past `budget` total, truncate with a count."""
+    if not lines:
+        embed.add_field(name=header, value=empty_text, inline=False)
+        return
+    used = 0
+    for i, line in enumerate(lines):
+        if used + len(line) + 1 > budget:
+            lines = lines[:i] + [f"…and {len(lines) - i} more"]
+            break
+        used += len(line) + 1
+    first, chunk = True, ""
+    for line in lines:
+        candidate = f"{chunk}\n{line}" if chunk else line
+        if len(candidate) > limit:
+            embed.add_field(name=header if first else _ZWSP, value=chunk, inline=False)
+            first, chunk = False, line
+        else:
+            chunk = candidate
+    if chunk:
+        embed.add_field(name=header if first else _ZWSP, value=chunk, inline=False)
 
 
 def _safe_name(member: discord.Member | None, user_id: int) -> str:
@@ -170,7 +205,7 @@ class SafeModal(discord.ui.Modal):
 # ── Pagination ───────────────────────────────────────────────────────────────
 
 class EmbedPaginatorView(SafeView):
-    def __init__(self, embeds: list[discord.Embed], *, timeout=180):
+    def __init__(self, embeds: list[discord.Embed], *, timeout=900):
         super().__init__(timeout=timeout)
         self.embeds = embeds
         self.index = 0
@@ -197,16 +232,18 @@ class EmbedPaginatorView(SafeView):
         await interaction.response.edit_message(embed=self.embeds[self.index], view=self)
 
 
-def _paginate_lines(lines: list[str], title: str, per_page: int = 10, char_limit: int = 3500) -> list[discord.Embed]:
+def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit: int = 3500) -> list[discord.Embed]:
+    """One embed holds as many lines as fit under the description cap (4096); only start a new page
+    when it's genuinely full. `per_page` is just a sanity ceiling, not a readability cap."""
     pages: list[list[str]] = []
     current: list[str] = []
     current_len = 0
     for line in lines:
-        if len(current) >= per_page or current_len + len(line) > char_limit:
+        if current and (len(current) >= per_page or current_len + len(line) + 2 > char_limit):
             pages.append(current)
             current, current_len = [], 0
         current.append(line)
-        current_len += len(line)
+        current_len += len(line) + 2    # +2 for the "\n\n" the lines are joined with
     if current:
         pages.append(current)
     if not pages:
@@ -425,11 +462,12 @@ class LogPagesModal(SafeModal, title="Log Sprint — Pages"):
         data["gg_awarded"] = True
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end))
         self.cog._check_all_logged(guild_id)
-        await _award_sprint_gg(interaction.client, interaction.guild, uid, SPRINT_GG)
+        gg = await _sprint_gg(interaction.client.db, guild_id)
+        await _award_sprint_gg(interaction.client, interaction.guild, uid, gg)
         _, total_pages = _combined_title_and_pages(data, end)
+        gg_note = f" — **{gg} GG** earned!" if gg > 0 else "!"
         await interaction.response.send_message(
-            f"✅ {interaction.user.mention} logged 📖 **page {end}** (+{total_pages} pages total) — "
-            f"**{SPRINT_GG} GG** earned!",
+            f"✅ {interaction.user.mention} logged 📖 **page {end}** (+{total_pages} pages total){gg_note}",
             ephemeral=False
         )
         await self.cog._update_end_embed(interaction.guild)
@@ -461,12 +499,13 @@ class LogAudioPctModal(SafeModal, title="Log Sprint — Audio %"):
         data["end"] = end_pct
         data["gg_awarded"] = True
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end_pct))
-        await _award_sprint_gg(interaction.client, interaction.guild, uid, SPRINT_GG)
+        gg = await _sprint_gg(interaction.client.db, guild_id)
+        await _award_sprint_gg(interaction.client, interaction.guild, uid, gg)
         self.cog._check_all_logged(guild_id)
         _, total_pages = _combined_title_and_pages(data, end_pct)
+        gg_note = f" — **{gg} GG** earned!" if gg > 0 else "!"
         await interaction.response.send_message(
-            f"✅ {interaction.user.mention} logged 🎧 **{end_pct:.1f}%** (+{total_pages} pages total) — "
-            f"**{SPRINT_GG} GG** earned!",
+            f"✅ {interaction.user.mention} logged 🎧 **{end_pct:.1f}%** (+{total_pages} pages total){gg_note}",
             ephemeral=False
         )
         await self.cog._update_end_embed(interaction.guild)
@@ -499,24 +538,34 @@ class SwitchBookOldModal(SafeModal):
             return
         gained = max(0, _leg_pages(data, end_val))
         old_title = data.get("title") or "Untitled"
-        data.setdefault("segments", []).append((old_title, gained))
+        # Held as *pending* until the next book is entered. Committing it now would count these pages
+        # twice if the switch is abandoned (the current leg still runs from its original start).
+        data["pending_segment"] = (old_title, gained)
+        data["end"] = end_val
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end_val))
-        await interaction.client.db.update_sprint_participant_segments(
-            guild_id, uid, json.dumps(data["segments"])
-        )
         await interaction.response.send_message(
             f"{_progress_message(interaction.client, interaction.user, gained)}\n"
-            f"📚 **{old_title}** locked in at +{gained} pages. Ready for your next book?",
-            view=SwitchBookContinueView(self.cog, self.ptype),
+            f"📚 **{old_title}** gets saved at +{gained} pages once you enter your next book — "
+            f"hit the button below.",
+            view=SwitchBookContinueView(self.cog, self.ptype, uid),
             ephemeral=False
         )
 
 
 class SwitchBookContinueView(SafeView):
-    def __init__(self, cog, ptype: str):
+    def __init__(self, cog, ptype: str, owner_id: int):
         super().__init__(timeout=300)
         self.cog = cog
         self.ptype = ptype
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This book switch belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
 
     @discord.ui.button(label="📚 Enter New Book", style=discord.ButtonStyle.success)
     async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -555,6 +604,13 @@ class SwitchBookNewModal(SafeModal):
             await interaction.response.send_message("You're not in this sprint.", ephemeral=True)
             return
         data = sprint["participants"][uid]
+        pending = data.get("pending_segment")
+        if not pending:
+            await interaction.response.send_message(
+                "Start from the **Switch Books** button first, so your current book's pages get saved.",
+                ephemeral=True
+            )
+            return
         title = self.title_input.value.strip()
         total_mins = None
         try:
@@ -571,10 +627,15 @@ class SwitchBookNewModal(SafeModal):
         except ValueError:
             await interaction.response.send_message("Please enter valid numbers.", ephemeral=True)
             return
-        # Persist before touching memory so a failed save doesn't leave the two out of sync.
-        await interaction.client.db.save_sprint_participant(
-            guild_id, uid, self.ptype, title, str(start), joined_at=data.get("joined_at")
+        # One statement saves the finished book as a segment AND starts the new one (and leaves the
+        # active-time clock alone), persisted before touching memory so a failed save can't desync them.
+        segments = list(data.get("segments") or []) + [pending]
+        await interaction.client.db.switch_sprint_participant_book(
+            guild_id, uid, self.ptype, title, str(start), json.dumps(segments),
+            joined_at=data.get("joined_at")
         )
+        data["segments"] = segments
+        data.pop("pending_segment", None)
         if total_mins:
             data["total_minutes"] = total_mins
         data["title"] = title
@@ -877,18 +938,7 @@ class Sprints(commands.Cog):
             else:
                 p_lines.append(f"{bookmark} <@{uid}> - page {data['start']}{suffix}")
 
-        first, chunk = True, ""
-        for line in p_lines:
-            candidate = f"{chunk}\n{line}" if chunk else line
-            if len(candidate) > self._FIELD_LIMIT:
-                main_embed.add_field(name=header if first else "​", value=chunk, inline=False)
-                first, chunk = False, line
-            else:
-                chunk = candidate
-        if chunk:
-            main_embed.add_field(name=header if first else "​", value=chunk, inline=False)
-        elif not p_lines:
-            main_embed.add_field(name=header, value="No participants yet", inline=False)
+        _add_chunked_field(main_embed, header, p_lines, "No participants yet", limit=self._FIELD_LIMIT)
 
         return [main_embed]
 
@@ -934,10 +984,10 @@ class Sprints(commands.Cog):
             ),
             color=RACE_COLOR
         )
-        embed.add_field(
-            name=f"{_emoji(self.bot, 'blankbook')} Sprint Patrons:",
-            value="\n".join(lines) if lines else "No participants.",
-            inline=False
+        # Every patron is listed (with a stamp once logged) however many there are, so this has to
+        # be chunked: one field caps at 1024 chars, which custom-emoji lines hit at ~12 patrons.
+        _add_chunked_field(
+            embed, f"{_emoji(self.bot, 'blankbook')} Sprint Patrons:", lines, "No participants."
         )
         return embed
 
@@ -1124,7 +1174,8 @@ class Sprints(commands.Cog):
         await interaction.response.defer()
         member = member or interaction.user
         stats = await self.bot.db.get_sprint_stats(interaction.guild.id, member.id)
-        gg_earned = (stats["sprints_completed"] or 0) * SPRINT_GG
+        gg_rate = await _sprint_gg(self.bot.db, interaction.guild.id)
+        gg_earned = (stats["sprints_completed"] or 0) * gg_rate
         pages = stats["total_pages"] or 0
         unlogged = int(stats["unlogged_sprints"] or 0)
 
@@ -1132,7 +1183,8 @@ class Sprints(commands.Cog):
         embed.add_field(name="Sprints Completed", value=str(stats["sprints_completed"] or 0))
         if pages:
             embed.add_field(name="📖 Pages Read", value=f"{pages:,}")
-        embed.add_field(name="GG Earned from Sprints", value=f"{gg_earned} GG")
+        if gg_rate > 0:
+            embed.add_field(name="GG Earned from Sprints", value=f"{gg_earned} GG")
         if unlogged:
             embed.add_field(name="🫣 Unlogged Sprints", value=str(unlogged))
         await interaction.followup.send(embed=embed)
@@ -1147,6 +1199,7 @@ class Sprints(commands.Cog):
             await interaction.followup.send("No sprint data yet!")
             return
 
+        gg_rate = await _sprint_gg(self.bot.db, interaction.guild.id)
         ordinals = ["1ST", "2ND", "3RD"] + [f"{i}TH" for i in range(4, len(rows) + 1)]
         lines = []
         for i, row in enumerate(rows):
@@ -1154,11 +1207,11 @@ class Sprints(commands.Cog):
             name = _safe_name(member, row["user_id"])
             sprints = row["sprints_completed"] or 0
             total_pages = row["total_pages"] or 0
-            gg = sprints * SPRINT_GG
+            gg_part = f" · Total Sprint GG Earned: {sprints * gg_rate:,} GG" if gg_rate > 0 else ""
             lines.append(
                 f"**{ordinals[i]} - {name.upper()}**\n"
                 f"{sprints} Sprint{'s' if sprints != 1 else ''} | "
-                f"Total Pages Logged: {total_pages:,} · Total Sprint GG Earned: {gg:,} GG"
+                f"Total Pages Logged: {total_pages:,}{gg_part}"
             )
         embeds = _paginate_lines(lines, "🏆 Sprint Leaderboard")
         view = EmbedPaginatorView(embeds) if len(embeds) > 1 else None
@@ -1240,10 +1293,11 @@ class Sprints(commands.Cog):
 
         await self.bot.db.delete_active_sprint(guild_id)
 
+        gg = await _sprint_gg(self.bot.db, guild_id)
         silent_gg_uids = []
         for uid, data in final_participants.items():
             if data["end"] is not None and not data.get("gg_awarded"):
-                await _award_sprint_gg(self.bot, guild, uid, SPRINT_GG)
+                await _award_sprint_gg(self.bot, guild, uid, gg)
                 data["gg_awarded"] = True
                 silent_gg_uids.append(uid)
 
@@ -1281,17 +1335,18 @@ class Sprints(commands.Cog):
                 dur = f" ({duration})" if duration else ""
                 lines.append(f"{prefix} **{name}** — +{pages} pages{suffix}{dur}")
             embeds = _paginate_lines(lines, "🏁 Griffin has recorded the sprint results…")
-            for e in embeds:
-                e.set_footer(text=f"Each participant earned {SPRINT_GG} GG!")
+            if gg > 0:
+                for e in embeds:
+                    e.set_footer(text=f"Each participant earned {gg} GG!")
             view = EmbedPaginatorView(embeds) if len(embeds) > 1 else None
             await channel.send(content=librarian_mention or None, embed=embeds[0], view=view)
         else:
             await channel.send(f"{librarian_mention}No one logged their results. 📭")
 
-        if silent_gg_uids:
+        if silent_gg_uids and gg > 0:
             mentions = " ".join(f"<@{uid}>" for uid in silent_gg_uids)
             await channel.send(
-                f"{mentions} — you updated your progress during the sprint and earned **{SPRINT_GG} GG**! 📚"
+                f"{mentions} — you updated your progress during the sprint and earned **{gg} GG**! 📚"
             )
 
         sprint_id = await self.bot.db.create_sprint(
@@ -1354,10 +1409,13 @@ class SprintDeleteConfirmView(SafeView):
     @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.bot.db.delete_sprint_log(self.sprint_id, interaction.user.id)
-        await self.bot.db.remove_gg(self.guild_id, interaction.user.id, SPRINT_GG)
+        gg = await _sprint_gg(self.bot.db, self.guild_id)
+        if gg > 0:
+            await self.bot.db.remove_gg(self.guild_id, interaction.user.id, gg)
         for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(content=f"🗑️ Log deleted and **{SPRINT_GG} GG** deducted.", view=self)
+        note = f" and **{gg} GG** deducted" if gg > 0 else ""
+        await interaction.response.edit_message(content=f"🗑️ Log deleted{note}.", view=self)
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -1413,8 +1471,10 @@ class SprintLogSelectView(SafeView):
     async def _on_delete(self, interaction: discord.Interaction):
         row = self.logs[self._selected]
         date = row["sprint_end_time"].strftime("%b %d") if row["sprint_end_time"] else "?"
+        gg = await _sprint_gg(self.bot.db, self.guild_id)
+        deduct_note = f" This will deduct **{gg} GG**." if gg > 0 else ""
         await interaction.response.send_message(
-            f"Delete **{row['title'] or 'Untitled'}** ({date})? This will deduct **{SPRINT_GG} GG**.",
+            f"Delete **{row['title'] or 'Untitled'}** ({date})?{deduct_note}",
             view=SprintDeleteConfirmView(self.bot, row["sprint_id"], self.guild_id),
             ephemeral=True,
         )

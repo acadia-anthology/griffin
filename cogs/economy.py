@@ -427,6 +427,15 @@ class SetRateGroup(GriffinModGroup):
             f"✅ Voice now earns **{amount} GG** per **{per}s**, prorated while connected."
         )
 
+    @app_commands.command(name="sprint", description="Set GG earned per completed sprint (0 turns it off).")
+    @app_commands.describe(amount="GG awarded per completed sprint — 0 stops sprints from awarding GG")
+    async def sprint(self, interaction: discord.Interaction, amount: app_commands.Range[int, 0]):
+        await self.db.set_sprint_gg(interaction.guild.id, amount)
+        if amount == 0:
+            await interaction.response.send_message("✅ Sprints no longer award GG.")
+        else:
+            await interaction.response.send_message(f"✅ Completed sprints now earn **{amount} GG**.")
+
 
 class LevelsEditModal(discord.ui.Modal, title="Edit Level Curve"):
     level_input = discord.ui.TextInput(
@@ -733,6 +742,8 @@ class StaffGroup(GriffinModGroup):
                 "and its cooldown",
                 "**/gg setrate voice** `<amount> <per>` — Set GG earned per interval in "
                 "voice, prorated while connected",
+                "**/gg setrate sprint** `<amount>` — Set GG earned per completed sprint "
+                "(0 turns it off)",
                 "**/gg levels view** — Show the full level/tier ladder and GG requirements",
                 "**/gg levels edit** — Modal to set a level's GG threshold (1-30) and/or the "
                 "flat rate for levels 31-100",
