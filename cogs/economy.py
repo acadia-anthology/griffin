@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import re
@@ -11,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from utils import cards, levels
+from utils.emoji_images import compress_emoji
 from utils.emojis import _FALLBACKS
 
 VOICE_TICK_MINUTES = 5
@@ -644,7 +646,8 @@ class RemoveEmojiView(discord.ui.View):
 
 class EmojiGroup(GriffinModGroup):
     """Upload / remove the emojis Griffin itself owns (they're shared everywhere Griffin is)."""
-    MAX_BYTES = 256 * 1024
+    MAX_BYTES = 256 * 1024          # Discord's limit; bigger uploads are shrunk automatically
+    MAX_INPUT_BYTES = 8 * 1024 * 1024
 
     def __init__(self, db):
         super().__init__(name="emoji", description="Upload or remove the emojis Griffin uses")
@@ -653,7 +656,7 @@ class EmojiGroup(GriffinModGroup):
     @app_commands.command(name="add", description="Upload a new emoji for Griffin to use.")
     @app_commands.describe(
         name="Letters, numbers and underscores. Use a name Griffin already expects to give it a new look",
-        image="PNG, JPG or GIF, under 256 KB",
+        image="PNG, JPG, GIF or WebP; big files are shrunk to fit automatically",
     )
     async def add(self, interaction: discord.Interaction, name: str, image: discord.Attachment):
         registry = interaction.client.app_emojis
@@ -667,23 +670,39 @@ class EmojiGroup(GriffinModGroup):
                 f"❌ There's already an emoji called `{name}`. Remove it first with `/staff emoji remove`, "
                 f"or pick another name.", ephemeral=True)
             return
-        if (image.content_type or "").split(";")[0] not in ("image/png", "image/jpeg", "image/gif"):
-            await interaction.response.send_message("❌ That needs to be a PNG, JPG or GIF.", ephemeral=True)
+        ctype = (image.content_type or "").split(";")[0]
+        if ctype not in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+            await interaction.response.send_message("❌ That needs to be a PNG, JPG, GIF or WebP.", ephemeral=True)
             return
-        if image.size > self.MAX_BYTES:
+        if image.size > self.MAX_INPUT_BYTES:
             await interaction.response.send_message(
-                f"❌ That file is {image.size // 1024} KB. Emojis have to be under 256 KB.", ephemeral=True)
+                f"❌ That file is {image.size / 1024 / 1024:.1f} MB — too big even to shrink. Try one under 8 MB.",
+                ephemeral=True)
             return
         await interaction.response.defer()
         try:
             data = await image.read()
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ I couldn't download that file: {e}", ephemeral=True)
+            return
+        shrunk = ""
+        if len(data) > self.MAX_BYTES or ctype == "image/webp":      # Discord takes PNG/JPG/GIF up to 256 KB
+            before = len(data)
+            try:
+                data, _ = await asyncio.to_thread(compress_emoji, data)    # off the event loop: GIFs take a moment
+            except ValueError as e:
+                await interaction.followup.send(f"❌ I couldn't shrink that: {e}.", ephemeral=True)
+                return
+            if before > self.MAX_BYTES:
+                shrunk = f" Shrunk from {before // 1024} KB to {max(1, len(data) // 1024)} KB."
+        try:
             emoji = await interaction.client.create_application_emoji(name=name, image=data)
         except discord.HTTPException as e:
             await interaction.followup.send(f"❌ Discord wouldn't take that emoji: {e}", ephemeral=True)
             return
         registry[emoji.name] = emoji
         note = "" if emoji.name in _FALLBACKS else " (Griffin doesn't use this name yet; it's stored for later.)"
-        await interaction.followup.send(f"✅ Added {emoji} as `{emoji.name}`.{note}")
+        await interaction.followup.send(f"✅ Added {emoji} as `{emoji.name}`.{shrunk}{note}")
 
     @app_commands.command(name="remove", description="Remove one of Griffin's emojis.")
     @app_commands.describe(name="Which emoji to remove")
