@@ -111,6 +111,9 @@ class Database:
             )
         """)
         await self._execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_timezone TEXT;")
+        await self._execute(
+            "ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS sprint_librarian_ping BOOLEAN DEFAULT FALSE;"
+        )
 
         await self._execute("""
             CREATE TABLE IF NOT EXISTS sprints (
@@ -169,6 +172,7 @@ class Database:
         await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS resumed_at TIMESTAMP;")
         await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS segments TEXT;")
         await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS total_minutes INTEGER;")
+        await self._execute("ALTER TABLE active_sprint_participants ADD COLUMN IF NOT EXISTS total_pages INTEGER;")
         await self._execute("ALTER TABLE active_sprint ADD COLUMN IF NOT EXISTS title TEXT;")
         await self._execute("ALTER TABLE active_sprint ADD COLUMN IF NOT EXISTS description TEXT;")
         await self._execute("ALTER TABLE active_sprint ADD COLUMN IF NOT EXISTS scheduled_id INTEGER;")
@@ -216,6 +220,9 @@ class Database:
                 PRIMARY KEY (user_id, guild_id, title)
             )
         """)
+        await self._execute("ALTER TABLE scheduled_sprint_participants ADD COLUMN IF NOT EXISTS total_pages INTEGER;")
+        await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS last_used TIMESTAMP;")
+        await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS finished BOOLEAN DEFAULT FALSE;")
 
     # --- members / GG ---
     # GG is purely cosmetic (rank + bragging rights) — nothing spends it, so
@@ -321,7 +328,7 @@ class Database:
             "SELECT message_rate, message_cooldown, voice_rate, voice_interval, "
             "levelup_channel_id, assets_channel_id, sprint_channel_id, sprint_role_id, "
             "sprint_manager_role_id, sprint_timezone, griffin_manager_role_id, "
-            "level_thresholds, level_flat_rate, sprint_gg "
+            "level_thresholds, level_flat_rate, sprint_gg, sprint_librarian_ping "
             "FROM guild_config WHERE guild_id = %s",
             guild_id
         )
@@ -329,6 +336,7 @@ class Database:
             # NULL means "never configured" -> the default; an explicit 0 must stay 0 (GG off).
             if row.get("sprint_gg") is None:
                 row["sprint_gg"] = DEFAULT_SPRINT_GG
+            row["sprint_librarian_ping"] = bool(row.get("sprint_librarian_ping"))
             return row
         return {
             "message_rate": DEFAULT_MESSAGE_RATE,
@@ -342,6 +350,7 @@ class Database:
             "sprint_manager_role_id": None,
             "sprint_timezone": None,
             "griffin_manager_role_id": None,
+            "sprint_librarian_ping": False,
             "level_thresholds": None,
             "level_flat_rate": None,
             "sprint_gg": DEFAULT_SPRINT_GG,
@@ -462,6 +471,14 @@ class Database:
             DO UPDATE SET tz_name = %s
         """, user_id, tz_name, tz_name)
 
+    async def set_sprint_librarian_ping(self, guild_id: int, enabled: bool):
+        await self._execute("""
+            INSERT INTO guild_config (guild_id, sprint_librarian_ping)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET sprint_librarian_ping = %s
+        """, guild_id, enabled, enabled)
+
     async def set_message_rate(self, guild_id: int, amount: int, cooldown: int):
         await self._execute("""
             INSERT INTO guild_config (guild_id, message_rate, message_cooldown)
@@ -549,19 +566,27 @@ class Database:
         """, guild_id, user_id, limit)
 
     async def get_recent_sprint_titles(self, guild_id: int, user_id: int, limit: int = 5) -> list:
+        """The person's most recent books (individual titles), newest first, minus any marked finished.
+        Joined/switched books are tracked in sprint_book_meta; older logged sprints fill in the history
+        from before that (combined 'A & B' log titles are skipped, they aren't one book)."""
         return await self._fetchall("""
-            SELECT title, type, last_used FROM (
-                SELECT sp.title,
-                       (array_agg(sp.type ORDER BY sp.sprint_end_time DESC NULLS LAST))[1] AS type,
-                       MAX(sp.sprint_end_time) AS last_used
+            SELECT title, MAX(last_used) AS last_used FROM (
+                SELECT m.title, m.last_used
+                FROM sprint_book_meta m
+                WHERE m.guild_id=%s AND m.user_id=%s
+                UNION ALL
+                SELECT sp.title, sp.sprint_end_time
                 FROM sprint_participants sp
                 JOIN sprints s ON s.id = sp.sprint_id
-                WHERE s.guild_id=%s AND sp.user_id=%s AND sp.title IS NOT NULL
-                GROUP BY sp.title
-            ) sub
-            ORDER BY last_used DESC NULLS LAST
+                WHERE s.guild_id=%s AND sp.user_id=%s AND sp.title IS NOT NULL AND sp.title NOT LIKE '%% & %%'
+            ) u
+            WHERE title NOT IN (
+                SELECT title FROM sprint_book_meta WHERE guild_id=%s AND user_id=%s AND finished
+            )
+            GROUP BY title
+            ORDER BY MAX(last_used) DESC NULLS LAST
             LIMIT %s
-        """, guild_id, user_id, limit)
+        """, guild_id, user_id, guild_id, user_id, guild_id, user_id, limit)
 
     async def get_sprint_book_meta(self, user_id: int, guild_id: int, title: str) -> Optional[dict]:
         return await self._fetchone(
@@ -570,15 +595,27 @@ class Database:
         )
 
     async def save_sprint_book_meta(self, user_id: int, guild_id: int, title: str,
-                                     total_pages: Optional[int] = None, total_minutes: Optional[int] = None):
+                                     total_pages: Optional[int] = None):
+        """Remembers a book (and its total pages, if known) and that it was just used. Using a book again
+        also brings it back if it had been marked finished."""
         await self._execute(
-            """INSERT INTO sprint_book_meta (user_id, guild_id, title, total_pages, total_minutes)
-               VALUES (%s,%s,%s,%s,%s)
+            """INSERT INTO sprint_book_meta (user_id, guild_id, title, total_pages, last_used, finished)
+               VALUES (%s,%s,%s,%s,(NOW() AT TIME ZONE 'UTC'),FALSE)
                ON CONFLICT (user_id, guild_id, title)
                DO UPDATE SET
                  total_pages = COALESCE(%s, sprint_book_meta.total_pages),
-                 total_minutes = COALESCE(%s, sprint_book_meta.total_minutes)""",
-            user_id, guild_id, title, total_pages, total_minutes, total_pages, total_minutes
+                 last_used = (NOW() AT TIME ZONE 'UTC'),
+                 finished = FALSE""",
+            user_id, guild_id, title, total_pages, total_pages
+        )
+
+    async def set_book_finished(self, user_id: int, guild_id: int, title: str, finished: bool = True):
+        await self._execute(
+            """INSERT INTO sprint_book_meta (user_id, guild_id, title, finished)
+               VALUES (%s,%s,%s,%s)
+               ON CONFLICT (user_id, guild_id, title)
+               DO UPDATE SET finished = %s""",
+            user_id, guild_id, title, finished, finished
         )
 
     async def get_sprint_leaderboard(self, guild_id: int, limit: int = 10) -> list:
@@ -623,20 +660,24 @@ class Database:
         await self._execute("DELETE FROM active_sprint_participants WHERE guild_id=%s", guild_id)
 
     async def save_sprint_participant(self, guild_id, user_id, ptype, title, start_val, end_val=None, joined_at=None,
-                                       total_minutes=None):
-        """Starts (or restarts, e.g. after starting fresh with a new book) a fresh active-time clock."""
+                                       total_pages=None, segments_json: str = "[]", carry_active_seconds: int = 0):
+        """Starts (or restarts, e.g. after starting fresh with a new book) the active-time clock. When starting
+        fresh, the earlier books' segments and already-banked active seconds are carried in, not dropped."""
         from datetime import datetime
         joined_at = _utc_naive(joined_at) or datetime.utcnow()
         await self._execute("""
             INSERT INTO active_sprint_participants
-                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at, total_minutes)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s,%s)
+                (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at,
+                 total_pages, segments)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (guild_id, user_id) DO UPDATE SET
                 type=%s, title=%s, start_val=%s, end_val=%s,
                 joined_at=COALESCE(active_sprint_participants.joined_at, %s),
-                active_seconds=0, resumed_at=%s, total_minutes=%s
-        """, guild_id, user_id, ptype, title, start_val, end_val, joined_at, joined_at, total_minutes,
-             ptype, title, start_val, end_val, joined_at, joined_at, total_minutes)
+                active_seconds=%s, resumed_at=%s, total_pages=%s, total_minutes=NULL, segments=%s
+        """, guild_id, user_id, ptype, title, start_val, end_val, joined_at, carry_active_seconds, joined_at,
+             total_pages, segments_json,
+             ptype, title, start_val, end_val, joined_at, carry_active_seconds, joined_at, total_pages,
+             segments_json)
 
     async def update_sprint_participant_end(self, guild_id, user_id, end_val):
         await self._execute(
@@ -666,7 +707,7 @@ class Database:
         """, guild_id, user_id)
 
     async def switch_sprint_participant_book(self, guild_id, user_id, ptype, title, start_val,
-                                              segments_json: str, joined_at=None, total_minutes=None):
+                                              segments_json: str, joined_at=None, total_pages=None):
         """Starts a participant's next book in one statement: new leg + saved segments together,
         leaving the active-time clock (joined_at / active_seconds / resumed_at) untouched."""
         from datetime import datetime
@@ -674,12 +715,13 @@ class Database:
         await self._execute("""
             INSERT INTO active_sprint_participants
                 (guild_id, user_id, type, title, start_val, end_val, joined_at, active_seconds, resumed_at,
-                 segments, total_minutes)
+                 segments, total_pages)
             VALUES (%s,%s,%s,%s,%s,NULL,%s,0,%s,%s,%s)
             ON CONFLICT (guild_id, user_id) DO UPDATE SET
                 type=EXCLUDED.type, title=EXCLUDED.title, start_val=EXCLUDED.start_val,
-                end_val=NULL, segments=EXCLUDED.segments, total_minutes=EXCLUDED.total_minutes
-        """, guild_id, user_id, ptype, title, start_val, joined_at, joined_at, segments_json, total_minutes)
+                end_val=NULL, segments=EXCLUDED.segments, total_pages=EXCLUDED.total_pages,
+                total_minutes=NULL
+        """, guild_id, user_id, ptype, title, start_val, joined_at, joined_at, segments_json, total_pages)
 
     # --- scheduled sprints ---------------------------------------------------------------
     # start_time is naive UTC. status: scheduled -> active -> done, or cancelled / missed.
@@ -697,9 +739,6 @@ class Database:
 
     async def get_scheduled_sprint(self, scheduled_id: int) -> Optional[dict]:
         return await self._fetchone("SELECT * FROM scheduled_sprints WHERE id=%s", scheduled_id)
-
-    async def get_scheduled_sprint_by_message(self, message_id: int) -> Optional[dict]:
-        return await self._fetchone("SELECT * FROM scheduled_sprints WHERE message_id=%s", message_id)
 
     async def list_scheduled_sprints(self, guild_id: int, statuses=("scheduled",)) -> list:
         return await self._fetchall("""
@@ -727,26 +766,6 @@ class Database:
                 "UPDATE scheduled_sprints SET status=%s WHERE id=%s AND status=%s RETURNING id",
                 status, scheduled_id, expected)
         return row is not None
-
-    async def save_scheduled_participant(self, scheduled_id, user_id, ptype, title, start_val, total_minutes=None):
-        await self._execute("""
-            INSERT INTO scheduled_sprint_participants (scheduled_id, user_id, type, title, start_val, total_minutes)
-            VALUES (%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (scheduled_id, user_id) DO UPDATE SET
-                type=EXCLUDED.type, title=EXCLUDED.title, start_val=EXCLUDED.start_val,
-                total_minutes=EXCLUDED.total_minutes
-        """, scheduled_id, user_id, ptype, title, start_val, total_minutes)
-
-    async def delete_scheduled_participant(self, scheduled_id: int, user_id: int) -> bool:
-        row = await self._fetchone(
-            "DELETE FROM scheduled_sprint_participants WHERE scheduled_id=%s AND user_id=%s RETURNING user_id",
-            scheduled_id, user_id)
-        return row is not None
-
-    async def get_scheduled_participant(self, scheduled_id: int, user_id: int) -> Optional[dict]:
-        return await self._fetchone(
-            "SELECT * FROM scheduled_sprint_participants WHERE scheduled_id=%s AND user_id=%s",
-            scheduled_id, user_id)
 
     async def get_scheduled_participants(self, scheduled_id: int) -> list:
         return await self._fetchall(

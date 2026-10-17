@@ -586,13 +586,36 @@ class RaceConfigGroup(GriffinModGroup):
 
     @app_commands.command(
         name="librarian-role",
-        description="Set who can manage sprints and gets pinged with results."
+        description="Set who can manage sprints (and who is pinged with results, if you turn that on)."
     )
-    @app_commands.describe(role="Role that can create/manage sprints and receives leaderboard pings")
+    @app_commands.describe(role="Role that can create/manage sprints")
     async def librarian_role(self, interaction: discord.Interaction, role: discord.Role):
         await self.db.set_sprint_manager_role(interaction.guild.id, role.id)
         await interaction.response.send_message(
-            f"✅ {role.mention} can now manage sprints and will be pinged with results."
+            f"✅ {role.mention} can now manage sprints. It is only pinged with results while "
+            f"`/staff race librarian-ping` is on."
+        )
+
+    @app_commands.command(
+        name="librarian-ping",
+        description="Turn the librarian-role ping on sprint results on or off (e.g. on for readathons)."
+    )
+    @app_commands.describe(setting="On = ping the librarian role with every results board; off = never")
+    @app_commands.choices(setting=[
+        app_commands.Choice(name="on", value=1),
+        app_commands.Choice(name="off", value=0),
+    ])
+    async def librarian_ping(self, interaction: discord.Interaction, setting: app_commands.Choice[int]):
+        await self.db.set_sprint_librarian_ping(interaction.guild.id, bool(setting.value))
+        cfg = await self.db.get_guild_config(interaction.guild.id)
+        role_id = cfg.get("sprint_manager_role_id")
+        if setting.value and not role_id:
+            note = " Set a role first with `/staff race librarian-role`, or there's no one to ping."
+        else:
+            note = ""
+        await interaction.response.send_message(
+            f"✅ The librarian role will {'now' if setting.value else 'no longer'} be pinged with sprint "
+            f"results.{note}"
         )
 
     @app_commands.command(
@@ -694,7 +717,7 @@ async def help_command(interaction: discord.Interaction):
             "**/race stats** `[member]` — View sprint stats for yourself or another member",
             "**/race leaderboard** — View the sprint leaderboard",
             "**/race edit** — Edit or delete one of your sprint logs",
-            "**/race scheduled** — See the upcoming scheduled sprints (and pre-join from there)",
+            "**/race scheduled** — See the upcoming scheduled sprints",
             "**/race timezone** — Set your timezone, used to read the times you type when scheduling",
         ])
     )
@@ -756,13 +779,15 @@ class StaffGroup(GriffinModGroup):
                 "gets archived to",
                 "**/staff channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
                 "**/race schedule** — Schedule a sprint ahead of time (one at a time). Start with a time "
-                "like `14:30` (your own timezone, asked once) or a countdown like `in 1h30m`",
+                "like `14:30` (your own timezone, asked once) or a countdown like `in 1h30m`. A small notice "
+                "goes up now; the join card and Page Racers ping go up 5 minutes before it starts",
                 "**/race unschedule** `<sprint>` — Cancel a scheduled sprint",
                 "**/race cancel** — Force-cancel the sprint that's running or collecting logs",
                 "**/race start** `Mod Test (5 min, no GG)` — A 5-minute practice sprint for testing (also offered in `/race schedule`); never awards GG",
                 "**/staff race ping-role** `<role>` — Set the role pinged when a sprint starts",
-                "**/staff race librarian-role** `<role>` — Set who can manage sprints and gets "
-                "pinged with results",
+                "**/staff race librarian-role** `<role>` — Set who can manage sprints",
+                "**/staff race librarian-ping** `<on/off>` — Ping the librarian role with sprint results "
+                "(off by default; turn on for readathons)",
                 "**/staff race timezone** `<timezone>` — Server fallback timezone (offered to people who haven't set their own)",
             ])
         )

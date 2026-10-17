@@ -4,6 +4,7 @@ from discord import app_commands
 from datetime import timezone, timedelta, datetime
 import asyncio
 import json
+import math
 import re
 import traceback
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
@@ -18,8 +19,8 @@ RACE_COLOR = discord.Color(0x26878D)
 
 active_sprints: dict[int, dict] = {}
 
-# Audio-length tiers -> pages-per-minute rate, used to convert an audiobook's
-# %-complete into a page-equivalent for a unified (pages-only) leaderboard.
+# LEGACY: audiobooks used to be converted from their length with these tiers. New joins give the book's
+# total pages instead; this only keeps sprints that were already running at the switch-over correct.
 _AUDIO_RATE_TIERS = ((300, 0.5), (720, 0.45), (990, 0.35))
 _AUDIO_RATE_DEFAULT = 0.3
 
@@ -100,6 +101,17 @@ def _safe_name(member: discord.Member | None, user_id: int) -> str:
     return member.display_name if member else f"User {user_id}"
 
 
+def _nm(member) -> str:
+    """Plain display name for message text. A mention in message content pings the person, and the only
+    pings we want are the sprint-created role ping and the focus start/end pings."""
+    return discord.utils.escape_markdown(member.display_name)
+
+
+def _uname(guild, user_id: int) -> str:
+    member = guild.get_member(user_id) if guild else None
+    return discord.utils.escape_markdown(_safe_name(member, user_id))
+
+
 def _lookup_participant_type(cog, guild_id: int, uid: int) -> str | None:
     """In-memory lookup of a participant's tracking type — checks the active
     sprint, then (during the post-sprint log window) the finishing sprint."""
@@ -124,6 +136,12 @@ def _aware(dt):
     if dt is not None and dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _created_text(start_time, role_mention: str = "") -> str:
+    """The line that goes with the Page Racers ping when a sprint opens for joining."""
+    line = f"### A sprint has been created for {discord.utils.format_dt(start_time, 'F')}, time to focus!"
+    return f"{role_mention}\n{line}" if role_mention else line
 
 
 def _message_url(guild_id: int, channel_id: int, message_id: int) -> str:
@@ -286,7 +304,7 @@ def _progress_message(bot, member: discord.Member, pages_delta: int, extra: str 
     book = _emoji(bot, "blankbook")
     extra_str = f" {extra}" if extra else ""
     return (
-        f"{stamp} {member.mention}, Griffin has recorded sprint progress!\n"
+        f"{stamp} {_nm(member)}, Griffin has recorded sprint progress!\n"
         f"{book} +{pages_delta} pages{extra_str}, has been added to the ledger."
     )
 
@@ -295,8 +313,11 @@ def _leg_pages(data: dict, end_val) -> int:
     """Pages gained for the participant's current book leg, given an end value."""
     if data["type"] == "audio_pct":
         gained_pct = end_val - data["start"]
-        total_minutes = data.get("total_minutes") or 0
-        return _audio_pct_to_pages(gained_pct, total_minutes) if total_minutes else 0
+        total_pages = data.get("total_pages") or 0
+        if total_pages:
+            return math.floor(total_pages * gained_pct / 100 + 0.5)       # whole pages, halves round up
+        total_minutes = data.get("total_minutes") or 0                      # sprints already running before
+        return _audio_pct_to_pages(gained_pct, total_minutes) if total_minutes else 0   # this change shipped
     return end_val - data["start"]
 
 
@@ -414,154 +435,151 @@ def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit
 
 # ── Modals ────────────────────────────────────────────────────────────────────
 
-class JoinPagesModal(SafeModal, title="Join Sprint — Pages"):
-    reading = discord.ui.TextInput(label="Reading title", placeholder="What are you reading?", required=False)
-    start_page = discord.ui.TextInput(label="Starting page", placeholder="e.g. 42", default="0")
+class JoinSprintModal(SafeModal):
+    """The one form for every way into a book: Join, Start Fresh and Switch Books. Tracking type,
+    a recent book (or a new one), where you're starting, and — for audiobooks — the book's total pages
+    (remembered per book, so it's only asked once)."""
 
-    def __init__(self, cog, prefill_title: str | None = None, scheduled_id: int | None = None):
-        super().__init__()
+    def __init__(self, cog, recent_titles: list[str], *, switch: bool = False, default_type: str = "pages"):
+        super().__init__(title="Switch Books — Next Book" if switch else "Join Sprint")
         self.cog = cog
-        self.scheduled_id = scheduled_id      # set when this is a *pre-join* for a scheduled sprint
-        if prefill_title:
-            self.reading.default = prefill_title
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if self.scheduled_id is not None:
-            try:
-                start = int(self.start_page.value)
-            except ValueError:
-                start = 0
-            title = self.reading.value or None
-            if await self.cog._save_prejoin(interaction, self.scheduled_id, "pages", title, str(start)):
-                suffix = f" — reading **{title}**" if title else ""
-                await interaction.response.send_message(
-                    f"✅ {interaction.user.mention} pre-joined at 📖 **page {start}**{suffix}!", ephemeral=False
-                )
-                await self.cog._update_scheduled_embed(interaction.guild, self.scheduled_id)
-            return
-        guild_id = interaction.guild.id
-        if guild_id not in active_sprints:
-            await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
-            return
-        if interaction.user.id in active_sprints[guild_id].get("participants", {}):
-            await interaction.response.send_message("You've already joined this sprint!", ephemeral=True)
-            return
-        try:
-            start = int(self.start_page.value)
-        except ValueError:
-            start = 0
-        title = self.reading.value or None
-        uid = interaction.user.id
-        joined_at = datetime.utcnow()
-        # Persist before touching memory: if the save fails, nothing is left behind, so the
-        # user can simply retry instead of being stuck as "already joined" with no roster entry.
-        await interaction.client.db.save_sprint_participant(guild_id, uid, "pages", title, str(start), joined_at=joined_at)
-        sprint = active_sprints.get(guild_id)
-        if not sprint:
-            await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
-            return
-        sprint["participants"][uid] = {
-            "type": "pages", "title": title, "start": start, "end": None, "joined_at": joined_at,
-            "gg_awarded": False, "segments": [],
-        }
-        suffix = f" — reading **{title}**" if title else ""
-        await interaction.response.send_message(
-            f"✅ {interaction.user.mention} joined at 📖 **page {start}**{suffix}!", ephemeral=False
-        )
-        await self.cog._update_join_embed(interaction.guild)
-
-
-class JoinAudioPctModal(SafeModal, title="Join Sprint — Audio %"):
-    listening = discord.ui.TextInput(label="Listening to", placeholder="What are you listening to?")
-    total_hours = discord.ui.TextInput(label="Total audiobook length (hh:mm or hours)", placeholder="e.g. 12 or 12:30")
-    start_pct = discord.ui.TextInput(label="Starting percentage", placeholder="e.g. 24")
-
-    def __init__(self, cog, prefill_title: str | None = None, prefill_total_mins: int | None = None,
-                 scheduled_id: int | None = None):
-        super().__init__()
-        self.cog = cog
-        self.scheduled_id = scheduled_id      # set when this is a *pre-join* for a scheduled sprint
-        if prefill_title:
-            self.listening.default = prefill_title
-        if prefill_total_mins:
-            self.total_hours.default = str(round(prefill_total_mins / 60, 2))
-
-    @staticmethod
-    def _parse_total_minutes(raw: str) -> int | None:
-        raw = raw.strip()
-        try:
-            if ":" in raw:
-                h, m = raw.split(":", 1)
-                return round(float(h) * 60 + float(m))
-            return round(float(raw) * 60)
-        except ValueError:
-            return None
-
-    async def _read_inputs(self, interaction: discord.Interaction):
-        """(title, pct, total_minutes), or None after telling the user what to fix."""
-        title = self.listening.value.strip()
-        try:
-            pct = float(self.start_pct.value.replace("%", "").strip())
-        except ValueError:
-            await interaction.response.send_message("Please enter a valid percentage.", ephemeral=True)
-            return None
-        total_mins = self._parse_total_minutes(self.total_hours.value)
-        if not total_mins:
-            await interaction.response.send_message(
-                "Please enter the total audiobook length as hours (e.g. `12`) or `hh:mm` (e.g. `12:30`).",
-                ephemeral=True
+        self.switch = switch
+        self.recent = list(recent_titles)[:3]
+        self.type_select = discord.ui.Select(options=[
+            discord.SelectOption(label="Pages", value="pages", emoji="📖", default=default_type != "audio_pct"),
+            discord.SelectOption(label="Audio %", value="audio_pct", emoji="🎧", default=default_type == "audio_pct"),
+        ])
+        self.add_item(discord.ui.Label(text="Tracking by", component=self.type_select))
+        self.book_select = None
+        if self.recent:
+            self.book_select = discord.ui.Select(
+                min_values=0, required=False, placeholder="Pick one of your recent books",
+                options=[discord.SelectOption(label=t[:100], value=str(i)) for i, t in enumerate(self.recent)],
             )
-            return None
-        return title, pct, total_mins
+            self.add_item(discord.ui.Label(text="Recent book", component=self.book_select))
+        self.new_title = discord.ui.TextInput(
+            required=False, max_length=100,
+            placeholder="Only if it isn't in the list above" if self.recent else "What are you reading?",
+        )
+        self.add_item(discord.ui.Label(text="New book name" if self.recent else "Book name", component=self.new_title))
+        self.start_input = discord.ui.TextInput(default="0", max_length=10, placeholder="e.g. 42, or 24 for 24%")
+        self.add_item(discord.ui.Label(text="Starting page (or % for audio)", component=self.start_input))
+        self.total_pages = discord.ui.TextInput(required=False, max_length=6, placeholder="Audiobooks only, e.g. 352")
+        self.add_item(discord.ui.Label(text="Book's total pages (for audio %)", component=self.total_pages))
+
+    async def _fail(self, interaction: discord.Interaction, message: str):
+        await interaction.response.send_message(f"❌ {message}", ephemeral=True)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if self.scheduled_id is not None:
-            inputs = await self._read_inputs(interaction)
-            if inputs is None:
-                return
-            title, pct, total_mins = inputs
-            if await self.cog._save_prejoin(interaction, self.scheduled_id, "audio_pct", title, str(pct), total_mins):
-                if title:
-                    await interaction.client.db.save_sprint_book_meta(
-                        interaction.user.id, interaction.guild.id, title, total_minutes=total_mins)
-                start_str = f"{pct:.1f}%".rstrip("0").rstrip(".")
-                await interaction.response.send_message(
-                    f"✅ {interaction.user.mention} pre-joined at 🎧 **{start_str}** — listening to **{title}**!",
-                    ephemeral=False
-                )
-                await self.cog._update_scheduled_embed(interaction.guild, self.scheduled_id)
+        db = interaction.client.db
+        guild_id, uid = interaction.guild.id, interaction.user.id
+        ptype = (self.type_select.values or ["pages"])[0]
+        chosen = self.recent[int(self.book_select.values[0])] if self.book_select and self.book_select.values else None
+        typed = (self.new_title.value or "").strip()
+        if chosen and typed:
+            await self._fail(interaction, "Pick one of your recent books **or** type a new one — not both.")
             return
-        guild_id = interaction.guild.id
-        if guild_id not in active_sprints:
-            await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
+        title = chosen or typed or None
+        if ptype == "audio_pct" and not title:
+            await self._fail(interaction, "Pick a recent book or type the audiobook's name.")
             return
-        if interaction.user.id in active_sprints[guild_id].get("participants", {}):
-            await interaction.response.send_message("You've already joined this sprint!", ephemeral=True)
+        raw_start = (self.start_input.value or "0").strip() or "0"
+        try:
+            start = int(raw_start) if ptype == "pages" else float(raw_start.replace("%", "").strip())
+        except ValueError:
+            await self._fail(interaction, "Your starting " + ("page" if ptype == "pages" else "percentage")
+                             + " needs to be a number.")
             return
-        inputs = await self._read_inputs(interaction)
-        if inputs is None:
+        if start < 0 or (ptype == "audio_pct" and start > 100):
+            await self._fail(interaction, "That starting " + ("page" if ptype == "pages" else "percentage")
+                             + " doesn't look right.")
             return
-        title, pct, total_mins = inputs
-        uid = interaction.user.id
-        joined_at = datetime.utcnow()
-        # Persist before touching memory (see JoinPagesModal) so a failed save leaves no ghost entry.
-        await interaction.client.db.save_sprint_participant(
-            guild_id, uid, "audio_pct", title, str(pct), joined_at=joined_at, total_minutes=total_mins)
-        if title:
-            await interaction.client.db.save_sprint_book_meta(uid, guild_id, title, total_minutes=total_mins)
+        total_pages = None
+        if ptype == "audio_pct":
+            raw_total = (self.total_pages.value or "").strip()
+            if raw_total:
+                try:
+                    total_pages = int(raw_total)
+                except ValueError:
+                    total_pages = 0
+                if total_pages <= 0:
+                    await self._fail(interaction, "The book's total pages needs to be a whole number, like `352`.")
+                    return
+            else:
+                meta = await db.get_sprint_book_meta(uid, guild_id, title)
+                total_pages = (meta or {}).get("total_pages")
+                if not total_pages:
+                    await self._fail(
+                        interaction,
+                        "For audiobooks I need the book's **total pages** (e.g. `352`) so I can turn your % into "
+                        "pages. I'll remember it for next time."
+                    )
+                    return
+        start_str = f"{start:.1f}%".rstrip("0").rstrip(".") if ptype == "audio_pct" else f"page {start}"
+        icon = _emoji(interaction.client, "headphones" if ptype == "audio_pct" else "blankbook")
+        stamp = _emoji(interaction.client, "librarystamp")
+        what = (f" — listening to **{title}**" if ptype == "audio_pct" else (f" — reading **{title}**" if title else ""))
+
         sprint = active_sprints.get(guild_id)
         if not sprint:
             await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
             return
-        sprint["participants"][uid] = {
-            "type": "audio_pct", "title": title, "start": pct,
-            "end": None, "joined_at": joined_at, "gg_awarded": False,
-            "total_minutes": total_mins, "segments": [],
-        }
-        start_str = f"{pct:.1f}%".rstrip("0").rstrip(".")
+
+        if self.switch:
+            data = sprint["participants"].get(uid)
+            if not data:
+                await interaction.response.send_message("You're not in this sprint.", ephemeral=True)
+                return
+            pending = data.get("pending_segment")
+            if not pending:
+                await interaction.response.send_message(
+                    "Start from the **Switch Books** button first, so your current book's pages get saved.",
+                    ephemeral=True
+                )
+                return
+            # One statement saves the finished book as a segment AND starts the new one (and leaves the
+            # active-time clock alone), persisted before touching memory so a failed save can't desync them.
+            segments = list(data.get("segments") or []) + [pending]
+            await db.switch_sprint_participant_book(
+                guild_id, uid, ptype, title, str(start), json.dumps(segments),
+                joined_at=data.get("joined_at"), total_pages=total_pages)
+            data["segments"] = segments
+            data.pop("pending_segment", None)
+            data["type"], data["title"], data["start"], data["end"] = ptype, title, start, None
+            data["total_pages"] = total_pages
+            data.pop("total_minutes", None)
+            if title:
+                await db.save_sprint_book_meta(uid, guild_id, title, total_pages=total_pages)
+            await interaction.response.send_message(
+                f"{_emoji(interaction.client, 'bookswap')} {_nm(interaction.user)} switched to "
+                f"**{title or 'a new book'}** — tracking continues!", ephemeral=False)
+            await self.cog._update_join_embed(interaction.guild)
+            return
+
+        if uid in sprint.get("participants", {}):
+            await interaction.response.send_message("You've already joined this sprint!", ephemeral=True)
+            return
+        joined_at = datetime.utcnow()
+        # Persist before touching memory: if the save fails, nothing is left behind, so the user can
+        # simply retry instead of being stuck as "already joined" with no roster entry.
+        carry = (sprint.get("carry") or {}).get(uid) or {}
+        await db.save_sprint_participant(
+            guild_id, uid, ptype, title, str(start), joined_at=joined_at, total_pages=total_pages,
+            segments_json=json.dumps(carry.get("segments", [])), carry_active_seconds=carry.get("active_seconds", 0))
+        if title:
+            await db.save_sprint_book_meta(uid, guild_id, title, total_pages=total_pages)
+        sprint = active_sprints.get(guild_id)
+        if not sprint:
+            await interaction.response.send_message("The sprint has already ended!", ephemeral=True)
+            return
+        entry = {"type": ptype, "title": title, "start": start, "end": None, "joined_at": joined_at,
+                 "gg_awarded": False, "segments": list(carry.get("segments", []))}
+        if total_pages:
+            entry["total_pages"] = total_pages
+        sprint["participants"][uid] = entry
+        (sprint.get("carry") or {}).pop(uid, None)
         await interaction.response.send_message(
-            f"✅ {interaction.user.mention} joined at 🎧 **{start_str}** — listening to **{title}**!", ephemeral=False
-        )
+            f"{stamp} {_nm(interaction.user)} joined at {icon} **{start_str}**{what}!", ephemeral=False)
         await self.cog._update_join_embed(interaction.guild)
 
 
@@ -660,16 +678,17 @@ class LogPagesModal(SafeModal, title="Log Sprint — Pages"):
         data["end"] = end
         data["gg_awarded"] = True
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end))
-        self.cog._check_all_logged(guild_id)
         gg = await _gg_for_duration(interaction.client.db, guild_id, sprint["duration"])
         await _award_sprint_gg(interaction.client, interaction.guild, uid, gg)
         _, total_pages = _combined_title_and_pages(data, end)
         gg_note = f" — **{gg} GG** earned!" if gg > 0 else "!"
         await interaction.response.send_message(
-            f"✅ {interaction.user.mention} logged 📖 **page {end}** (+{total_pages} pages total){gg_note}",
+            f"{_emoji(interaction.client, 'librarystamp')} {_nm(interaction.user)} logged "
+            f"{_emoji(interaction.client, 'blankbook')} **page {end}** (+{total_pages} pages total){gg_note}",
             ephemeral=False
         )
         await self.cog._update_end_embed(interaction.guild)
+        self.cog._check_all_logged(guild_id)         # last: the board must come after everyone's confirmation
 
 
 class LogAudioPctModal(SafeModal, title="Log Sprint — Audio %"):
@@ -700,14 +719,15 @@ class LogAudioPctModal(SafeModal, title="Log Sprint — Audio %"):
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end_pct))
         gg = await _gg_for_duration(interaction.client.db, guild_id, sprint["duration"])
         await _award_sprint_gg(interaction.client, interaction.guild, uid, gg)
-        self.cog._check_all_logged(guild_id)
         _, total_pages = _combined_title_and_pages(data, end_pct)
         gg_note = f" — **{gg} GG** earned!" if gg > 0 else "!"
         await interaction.response.send_message(
-            f"✅ {interaction.user.mention} logged 🎧 **{end_pct:.1f}%** (+{total_pages} pages total){gg_note}",
+            f"{_emoji(interaction.client, 'librarystamp')} {_nm(interaction.user)} logged "
+            f"{_emoji(interaction.client, 'headphones')} **{end_pct:.1f}%** (+{total_pages} pages total){gg_note}",
             ephemeral=False
         )
         await self.cog._update_end_embed(interaction.guild)
+        self.cog._check_all_logged(guild_id)
 
 
 # ── Switch Books ─────────────────────────────────────────────────────────────
@@ -768,7 +788,7 @@ class SwitchBookContinueView(SafeView):
 
     @discord.ui.button(label="📚 Enter New Book", style=discord.ButtonStyle.success)
     async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SwitchBookNewModal(self.cog, self.ptype))
+        await self.cog._open_join_modal(interaction, switch=True, default_type=self.ptype)
         for item in self.children:
             item.disabled = True
         try:
@@ -777,134 +797,7 @@ class SwitchBookContinueView(SafeView):
             pass
 
 
-class SwitchBookNewModal(SafeModal):
-    def __init__(self, cog, ptype: str):
-        super().__init__(title="Switch Books — New Book")
-        self.cog = cog
-        self.ptype = ptype
-        self.title_input = discord.ui.TextInput(label="New book title", placeholder="What are you starting?")
-        self.add_item(self.title_input)
-        if ptype == "pages":
-            self.start_input = discord.ui.TextInput(label="Starting page", placeholder="e.g. 0", default="0")
-            self.add_item(self.start_input)
-        else:
-            self.start_input = discord.ui.TextInput(label="Starting percentage", placeholder="e.g. 0", default="0")
-            self.total_input = discord.ui.TextInput(
-                label="Total audiobook length (hh:mm or hours)", placeholder="e.g. 12 or 12:30"
-            )
-            self.add_item(self.start_input)
-            self.add_item(self.total_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild_id = interaction.guild.id
-        uid = interaction.user.id
-        sprint = active_sprints.get(guild_id)
-        if not sprint or uid not in sprint["participants"]:
-            await interaction.response.send_message("You're not in this sprint.", ephemeral=True)
-            return
-        data = sprint["participants"][uid]
-        pending = data.get("pending_segment")
-        if not pending:
-            await interaction.response.send_message(
-                "Start from the **Switch Books** button first, so your current book's pages get saved.",
-                ephemeral=True
-            )
-            return
-        title = self.title_input.value.strip()
-        total_mins = None
-        try:
-            if self.ptype == "pages":
-                start = int(self.start_input.value)
-            else:
-                start = float(self.start_input.value.replace("%", ""))
-                total_mins = JoinAudioPctModal._parse_total_minutes(self.total_input.value)
-                if not total_mins:
-                    await interaction.response.send_message(
-                        "Please enter a valid total length as hours or `hh:mm`.", ephemeral=True
-                    )
-                    return
-        except ValueError:
-            await interaction.response.send_message("Please enter valid numbers.", ephemeral=True)
-            return
-        # One statement saves the finished book as a segment AND starts the new one (and leaves the
-        # active-time clock alone), persisted before touching memory so a failed save can't desync them.
-        segments = list(data.get("segments") or []) + [pending]
-        await interaction.client.db.switch_sprint_participant_book(
-            guild_id, uid, self.ptype, title, str(start), json.dumps(segments),
-            joined_at=data.get("joined_at"), total_minutes=total_mins or data.get("total_minutes")
-        )
-        data["segments"] = segments
-        data.pop("pending_segment", None)
-        if total_mins:
-            data["total_minutes"] = total_mins
-        data["title"] = title
-        data["start"] = start
-        data["end"] = None
-        await interaction.response.send_message(
-            f"📖 {interaction.user.mention} switched to **{title}** — tracking continues!", ephemeral=False
-        )
-        await self.cog._update_join_embed(interaction.guild)
-
-
 # ── Views ─────────────────────────────────────────────────────────────────────
-
-class BookSelectView(SafeView):
-    def __init__(self, cog, titles: list[str], modal_type: str, scheduled_id: int | None = None):
-        super().__init__(timeout=60)
-        self.cog = cog
-        self.scheduled_id = scheduled_id
-        options = [discord.SelectOption(label=t[:100], value=t[:100]) for t in titles]
-        options.append(discord.SelectOption(label="Enter a different title...", value="__new__"))
-        select = discord.ui.Select(placeholder="Pick a recent book or enter a new one...", options=options)
-        select.callback = self._make_callback(modal_type)
-        self.add_item(select)
-
-    def _make_callback(self, modal_type: str):
-        async def callback(interaction: discord.Interaction):
-            chosen = interaction.data["values"][0]
-            uid = interaction.user.id
-            guild_id = interaction.guild.id
-            meta = None
-            if chosen != "__new__":
-                meta = await interaction.client.db.get_sprint_book_meta(uid, guild_id, chosen)
-            if modal_type == "pages":
-                modal = JoinPagesModal(self.cog, prefill_title=chosen if chosen != "__new__" else None,
-                                       scheduled_id=self.scheduled_id)
-            else:
-                total_mins = meta.get("total_minutes") if meta else None
-                modal = JoinAudioPctModal(
-                    self.cog,
-                    prefill_title=chosen if chosen != "__new__" else None,
-                    prefill_total_mins=total_mins,
-                    scheduled_id=self.scheduled_id,
-                )
-            await interaction.response.send_modal(modal)
-        return callback
-
-
-class JoinTypeView(SafeView):
-    def __init__(self, cog, scheduled_id: int | None = None):
-        super().__init__(timeout=120)
-        self.cog = cog
-        self.scheduled_id = scheduled_id
-
-    @discord.ui.select(
-        placeholder="How are you tracking?",
-        options=[
-            discord.SelectOption(label="Pages", emoji="📖", value="pages"),
-            discord.SelectOption(label="Audio %", emoji="🎧", value="audio_pct"),
-        ]
-    )
-    async def type_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        ptype = select.values[0]
-        titles = await interaction.client.db.get_recent_sprint_titles(interaction.guild.id, interaction.user.id, limit=3)
-        if titles:
-            view = BookSelectView(self.cog, [r["title"] for r in titles], ptype, self.scheduled_id)
-            await interaction.response.edit_message(content="📚 Pick your book:", view=view)
-        else:
-            modal_cls = JoinPagesModal if ptype == "pages" else JoinAudioPctModal
-            await interaction.response.send_modal(modal_cls(self.cog, scheduled_id=self.scheduled_id))
-
 
 class ResumeOrFreshView(SafeView):
     """Shown when a paused (left) entry already exists for this participant."""
@@ -921,18 +814,30 @@ class ResumeOrFreshView(SafeView):
             sprint["participants"][uid]["resumed_at"] = datetime.utcnow()
             sprint["participants"][uid]["left"] = False
         await interaction.response.edit_message(content="▶️ Resumed — clock's running again.", view=None)
-        await interaction.channel.send(f"▶️ {interaction.user.mention} has resumed the sprint!")
+        await interaction.channel.send(f"{_emoji(interaction.client, 'griffinreading')} {_nm(interaction.user)} has resumed the sprint!")
         await self.cog._update_join_embed(interaction.guild)
 
     @discord.ui.button(label="📚 Start Fresh (new book)", style=discord.ButtonStyle.secondary)
     async def fresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = interaction.guild.id
         sprint = active_sprints.get(guild_id)
+        uid = interaction.user.id
         if sprint:
-            sprint["participants"].pop(interaction.user.id, None)
-        await interaction.response.edit_message(
-            content="How would you like to track your sprint?", view=JoinTypeView(self.cog)
-        )
+            data = sprint["participants"].pop(uid, None)
+            if data:
+                # Starting fresh must not throw away the book they just left: bank its pages as a segment
+                # (like Switch Books does) and keep the active time they've already put in.
+                segments = list(data.get("segments") or [])
+                if data.get("end") is not None:
+                    gained = _leg_pages(data, data["end"])
+                    if gained > 0:
+                        segments.append((data.get("title") or "", gained))
+                banked = 0
+                for row in await interaction.client.db.get_sprint_participants(guild_id):
+                    if row["user_id"] == uid:
+                        banked = row.get("active_seconds") or 0
+                sprint.setdefault("carry", {})[uid] = {"segments": segments, "active_seconds": banked}
+        await self.cog._open_join_modal(interaction)
 
 
 class JoinSprintView(SafeView):
@@ -957,9 +862,7 @@ class JoinSprintView(SafeView):
                 ephemeral=True
             )
             return
-        await interaction.response.send_message(
-            "How would you like to track your sprint?", view=JoinTypeView(self.cog), ephemeral=True
-        )
+        await self.cog._open_join_modal(interaction)
 
     @discord.ui.button(label="🔄 Update Progress", style=discord.ButtonStyle.success, custom_id="sprint_update_btn", row=0)
     async def update_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1007,7 +910,7 @@ class JoinSprintView(SafeView):
         sprint["participants"][uid]["left"] = True
         await interaction.client.db.leave_sprint_participant(guild_id, uid)
         await interaction.response.send_message(
-            f"⏸️ {interaction.user.mention} has left the sprint — the clock's paused. "
+            f"{_emoji(interaction.client, 'griffinsleepy')} {_nm(interaction.user)} has left the sprint — the clock's paused. "
             f"Hit **Join Sprint** any time to resume.", ephemeral=False
         )
         await self.cog._update_join_embed(interaction.guild)
@@ -1258,48 +1161,6 @@ class ScheduleAnotherView(SafeView):
         await interaction.response.send_modal(ScheduleSprintModal(self.cog, self.tz_name, self.prefill_date))
 
 
-class ScheduledSprintView(SafeView):
-    """Persistent view on a scheduled sprint's announcement. Looked up by message id, so it survives
-    restarts. When the sprint goes live the same message is edited over to the regular JoinSprintView."""
-
-    def __init__(self, cog):
-        super().__init__(timeout=None)
-        self.cog = cog
-
-    @discord.ui.button(label="🕯️ Pre-Join", style=discord.ButtonStyle.success, custom_id="sched_prejoin_btn", row=0)
-    async def prejoin_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db = interaction.client.db
-        row = await db.get_scheduled_sprint_by_message(interaction.message.id)
-        if not row or row["status"] != "scheduled":
-            await interaction.response.send_message("❌ This sprint isn't open for pre-joining anymore.", ephemeral=True)
-            return
-        if await db.get_scheduled_participant(row["id"], interaction.user.id):
-            await interaction.response.send_message(
-                "You're already pre-joined — hit **Cancel Pre-Join** first if you need to change your book.",
-                ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            "How would you like to track your sprint?",
-            view=JoinTypeView(self.cog, scheduled_id=row["id"]), ephemeral=True
-        )
-
-    @discord.ui.button(label="🚪 Cancel Pre-Join", style=discord.ButtonStyle.danger, custom_id="sched_unjoin_btn", row=0)
-    async def unjoin_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db = interaction.client.db
-        row = await db.get_scheduled_sprint_by_message(interaction.message.id)
-        if not row or row["status"] != "scheduled":
-            await interaction.response.send_message("❌ This sprint isn't open for pre-joining anymore.", ephemeral=True)
-            return
-        if not await db.delete_scheduled_participant(row["id"], interaction.user.id):
-            await interaction.response.send_message("You haven't pre-joined this sprint.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            f"🚪 {interaction.user.mention} left the pre-join list for **{row['title']}**.", ephemeral=False
-        )
-        await self.cog._update_scheduled_embed(interaction.guild, row["id"])
-
-
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Sprints(commands.Cog):
@@ -1324,7 +1185,6 @@ class Sprints(commands.Cog):
     async def cog_load(self):
         self.bot.add_view(JoinSprintView(self))
         self.bot.add_view(LogProgressView(self))
-        self.bot.add_view(ScheduledSprintView(self))
         self._spawn(self._restore_sprints())
         self.scheduler_tick.start()
 
@@ -1361,6 +1221,7 @@ class Sprints(commands.Cog):
                         "gg_awarded": end is not None,
                         "segments": _parse_segments(p.get("segments")),
                         "total_minutes": p.get("total_minutes"),
+                        "total_pages": p.get("total_pages"),
                         "left": p.get("resumed_at") is None,
                     }
                 sprint = {
@@ -1373,6 +1234,11 @@ class Sprints(commands.Cog):
                 }
                 active_sprints[guild.id] = sprint
                 self._spawn(self._run_sprint_lifecycle(guild, sprint))
+            for guild in self.bot.guilds:
+                try:
+                    await self._refresh_scheduled_messages(guild)
+                except Exception:
+                    traceback.print_exc()
         finally:
             self._restored.set()
 
@@ -1384,13 +1250,13 @@ class Sprints(commands.Cog):
             return
         participant_ids = [uid for uid, d in sprint["participants"].items() if not d.get("left")]
         mentions = " ".join(f"<@{uid}>" for uid in participant_ids) or None
-        title_line = f"**{sprint['title']}**\n" if sprint.get("title") else ""
+        title_line = f"### {sprint['title']}\n" if sprint.get("title") else ""
         end_time = sprint["end_time"]
         start_embed = discord.Embed(
             description=(
-                f"{_emoji(self.bot, 'litcandle')} **__Focus Time Started!__**\n{title_line}\n"
-                f"{_emoji(self.bot, 'griffinreading')} Griffin has lit the candle and commands all patrons "
-                f"to open their tomes, focus time has begun!\n\n"
+                f"## {_emoji(self.bot, 'litcandle')} Focus Time Started!\n{title_line}\n"
+                f"{_emoji(self.bot, 'griffinreading')} *Griffin has lit the candle and commands all patrons "
+                f"to open their tomes, focus time has begun!*\n\n"
                 f"{_emoji(self.bot, 'hourglass')} The sprint ends at "
                 f"{discord.utils.format_dt(end_time, 'F')} ({discord.utils.format_dt(end_time, 'R')})."
             ),
@@ -1436,9 +1302,9 @@ class Sprints(commands.Cog):
         sprint = active_sprints.get(guild.id)
         participants = sprint["participants"] if sprint else {}
 
-        head = [f"{_emoji(self.bot, 'announcement')} **__The Stacks Go Silent…__**"]
+        head = [f"## {_emoji(self.bot, 'announcement')} The Stacks Go Silent…"]
         if title:
-            head.append(f"**{title}**")
+            head.append(f"### {title}")
         if description:
             head.append(description)
         lines = [
@@ -1472,9 +1338,9 @@ class Sprints(commands.Cog):
             suffix = f" of **{title}**" if title else ""
             bookmark = _emoji(self.bot, "bookmark")
             if data["type"] == "audio_pct":
-                p_lines.append(f"{bookmark} <@{uid}> - {data['start']:.1f}%{suffix}")
+                p_lines.append(f"{bookmark} {_uname(guild, uid)} - {data['start']:.1f}%{suffix}")
             else:
-                p_lines.append(f"{bookmark} <@{uid}> - page {data['start']}{suffix}")
+                p_lines.append(f"{bookmark} {_uname(guild, uid)} - page {data['start']}{suffix}")
 
         _add_chunked_field(main_embed, header, p_lines, "No participants yet", limit=self._FIELD_LIMIT)
 
@@ -1514,12 +1380,12 @@ class Sprints(commands.Cog):
         stamp = _emoji(self.bot, "librarystamp")
         for uid, data in participants.items():
             mark = f" {stamp}" if data.get("end") is not None else ""
-            lines.append(f"{ink} <@{uid}>{mark}")
+            lines.append(f"{ink} {_uname(self.bot.get_guild(guild_id), uid)}{mark}")
         embed = discord.Embed(
             description=(
-                f"{_emoji(self.bot, 'snuffedcandle')} **__Focus Time Ended!__**\n\n"
-                f"{_emoji(self.bot, 'griffinsleepy')} Griffin snuffs out the candles and demands all patrons "
-                f"close tomes and report pages immediately!\n\n"
+                f"## {_emoji(self.bot, 'snuffedcandle')} Focus Time Ended!\n\n"
+                f"{_emoji(self.bot, 'griffinsleepy')} *Griffin snuffs out the candle and demands all patrons "
+                f"close tomes and report pages immediately!*\n\n"
                 f"Patrons have {LOG_WINDOW_MINUTES} minutes to update progress, "
                 f"until {discord.utils.format_dt(deadline, 'R')}."
             ),
@@ -1630,7 +1496,7 @@ class Sprints(commands.Cog):
         view = JoinSprintView(self)
 
         await interaction.response.send_message(
-            content=role_mention if role_mention else None,
+            content=_created_text(start_time, role_mention),
             embeds=embeds, view=view,
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
@@ -1691,65 +1557,36 @@ class Sprints(commands.Cog):
 
     # ── Scheduling ────────────────────────────────────────────────────────────────────────────
 
-    def _build_scheduled_embed(self, guild: discord.Guild, row: dict, prejoiners: list) -> discord.Embed:
+    def _build_scheduled_embed(self, guild: discord.Guild, row: dict) -> discord.Embed:
+        """The small 'a sprint is scheduled' notice: title, when, how long. No buttons and no ping; the
+        join card (with the Page Racers ping) goes up as its own message when the join window opens."""
         start = _aware(row["start_time"])
-        end = start + timedelta(minutes=row["duration_minutes"])
-        host = guild.get_member(row["host_id"])
-        host_name = host.display_name if host else "Unknown"
-        lines = [f"{_emoji(self.bot, 'announcement')} **__Sprint Scheduled__**", f"**{row['title']}**"]
+        lines = [f"## {_emoji(self.bot, 'announcement')} A Community Sprint has been scheduled…",
+                 f"### {row['title']}"]
         if row.get("description"):
             lines.append(row["description"])
         lines += [
             "",
-            f"{_emoji(self.bot, 'griffinlurk')} **Host:** {host_name}",
-            f"{_emoji(self.bot, 'litcandle')} **Start Time:** {discord.utils.format_dt(start, 'F')} "
+            f"{_emoji(self.bot, 'litcandle')} **Starts:** {discord.utils.format_dt(start, 'F')} "
             f"*({discord.utils.format_dt(start, 'R')})*",
-            f"{_emoji(self.bot, 'snuffedcandle')} **End Time:** {discord.utils.format_dt(end, 'F')} "
-            f"*({discord.utils.format_dt(end, 'R')})*",
             f"{_emoji(self.bot, 'hourglass')} **Duration:** {_format_duration(row['duration_minutes'])}",
             *(["🧪 **Mod Test sprint — no GG is awarded.**"] if row["duration_minutes"] == TEST_SPRINT_MINUTES else []),
             "",
-            f"*Joining opens {SCHEDULED_JOIN_MINUTES} minutes before focus time. Pre-join below to save your spot.*",
+            f"*A join card goes up {SCHEDULED_JOIN_MINUTES} minutes before focus time — watch for the ping!*",
         ]
-        embed = discord.Embed(description="\n".join(lines), color=RACE_COLOR)
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-        bookmark = _emoji(self.bot, "bookmark")
-        p_lines = []
-        for p in prejoiners:
-            suffix = f" of **{p['title']}**" if p.get("title") else ""
-            if p["type"] == "audio_pct":
-                p_lines.append(f"{bookmark} <@{p['user_id']}> - {float(p['start_val']):.1f}%{suffix}")
-            else:
-                p_lines.append(f"{bookmark} <@{p['user_id']}> - page {p['start_val']}{suffix}")
-        _add_chunked_field(
-            embed, f"{_emoji(self.bot, 'blankbook')} Pre-Joined Patrons:", p_lines,
-            "No one yet — hit **Pre-Join** to save your spot!", limit=self._FIELD_LIMIT,
-        )
-        return embed
+        return discord.Embed(description="\n".join(lines), color=RACE_COLOR)
 
     def _build_scheduled_closed_embed(self, row: dict, reason: str) -> discord.Embed:
         start = _aware(row["start_time"])
-        label = "🛑 Cancelled" if reason == "cancelled" else "⚠️ Missed — Griffin was busy or offline"
+        label = {
+            "cancelled": "🛑 Cancelled",
+            "started": "✅ Open for joining — the join card is below",
+        }.get(reason, "⚠️ Missed — Griffin was busy or offline")
+        struck = f"~~**{row['title']}**~~" if reason != "started" else f"**{row['title']}**"
         return discord.Embed(
-            description=f"~~**{row['title']}**~~\n{label}\n*Was scheduled for {discord.utils.format_dt(start, 'F')}*",
+            description=f"{struck}\n{label}\n*Scheduled for {discord.utils.format_dt(start, 'F')}*",
             color=RACE_COLOR,
         )
-
-    async def _update_scheduled_embed(self, guild: discord.Guild, scheduled_id: int):
-        row = await self.bot.db.get_scheduled_sprint(scheduled_id)
-        if not row or not row.get("message_id") or row["status"] != "scheduled":
-            return
-        channel = await _get_channel(guild, row["channel_id"])
-        if not channel:
-            return
-        try:
-            msg = await channel.fetch_message(row["message_id"])
-            prejoiners = await self.bot.db.get_scheduled_participants(scheduled_id)
-            await msg.edit(embeds=[self._build_scheduled_embed(guild, row, prejoiners)])
-        except Exception:
-            print(f"_update_scheduled_embed failed for scheduled sprint {scheduled_id}:")
-            traceback.print_exc()
 
     async def _close_scheduled_message(self, guild: discord.Guild, row: dict, reason: str):
         if not row.get("message_id"):
@@ -1764,18 +1601,29 @@ class Sprints(commands.Cog):
             print(f"_close_scheduled_message failed for scheduled sprint {row['id']}:")
             traceback.print_exc()
 
-    async def _save_prejoin(self, interaction: discord.Interaction, scheduled_id: int, ptype: str,
-                            title: str | None, start_val: str, total_minutes: int | None = None) -> bool:
-        row = await self.bot.db.get_scheduled_sprint(scheduled_id)
-        if not row or row["status"] != "scheduled":
-            await interaction.response.send_message(
-                "❌ This sprint isn't open for pre-joining anymore.", ephemeral=True
-            )
-            return False
-        await self.bot.db.save_scheduled_participant(
-            scheduled_id, interaction.user.id, ptype, title, start_val, total_minutes
-        )
-        return True
+    async def _refresh_scheduled_messages(self, guild: discord.Guild):
+        """Brings still-waiting scheduled announcements up to the small, button-free format (ones posted by an
+        earlier version carried a big card and Pre-Join buttons that no longer do anything)."""
+        for row in await self.bot.db.list_scheduled_sprints(guild.id, ("scheduled",)):
+            if not row.get("message_id"):
+                continue
+            try:
+                channel = await _get_channel(guild, row["channel_id"])
+                msg = await channel.fetch_message(row["message_id"]) if channel else None
+                if msg is not None:
+                    await msg.edit(content=None, embeds=[self._build_scheduled_embed(guild, row)], view=None)
+            except discord.NotFound:
+                continue                 # someone deleted the announcement; nothing to tidy
+            except Exception:
+                print(f"_refresh_scheduled_messages failed for scheduled sprint {row['id']}:")
+                traceback.print_exc()
+
+    async def _open_join_modal(self, interaction: discord.Interaction, *, switch: bool = False,
+                               default_type: str = "pages"):
+        """Opens the one-step join form straight from a button, with the person's last 3 books to pick from."""
+        rows = await self.bot.db.get_recent_sprint_titles(interaction.guild.id, interaction.user.id, limit=3)
+        await interaction.response.send_modal(JoinSprintModal(
+            self, [r["title"] for r in rows], switch=switch, default_type=default_type))
 
     async def _find_schedule_conflict(self, guild_id: int, start_utc, duration: int):
         """Another scheduled/active sprint whose window — joining time before it through log time after
@@ -1824,7 +1672,7 @@ class Sprints(commands.Cog):
         try:
             row = await db.get_scheduled_sprint(sid)
             msg = await channel.send(
-                embeds=[self._build_scheduled_embed(guild, row, [])], view=ScheduledSprintView(self)
+                embeds=[self._build_scheduled_embed(guild, row)]
             )
             await db.set_scheduled_message_id(sid, msg.id)
         except Exception:
@@ -1902,12 +1750,11 @@ class Sprints(commands.Cog):
         lines = []
         for r in rows:
             start = _aware(r["start_time"])
-            count = len(await db.get_scheduled_participants(r["id"]))
-            link = (f" · [Pre-join]({_message_url(interaction.guild.id, r['channel_id'], r['message_id'])})"
+            link = (f" · [Details]({_message_url(interaction.guild.id, r['channel_id'], r['message_id'])})"
                     if r.get("message_id") else "")
             lines.append(
                 f"**{r['title']}**\n{discord.utils.format_dt(start, 'F')} ({discord.utils.format_dt(start, 'R')}) · "
-                f"{_format_duration(r['duration_minutes'])} · {count} pre-joined{link}"
+                f"{_format_duration(r['duration_minutes'])}{link}"
             )
         embeds = _paginate_lines(lines, "📜 Scheduled Sprints")
         kwargs = {"view": EmbedPaginatorView(embeds)} if len(embeds) > 1 else {}   # response.send_message rejects view=None
@@ -1940,7 +1787,7 @@ class Sprints(commands.Cog):
             return
         await self._close_scheduled_message(interaction.guild, row, "cancelled")
         await interaction.response.send_message(
-            f"🛑 {interaction.user.mention} cancelled the scheduled sprint **{row['title']}**."
+            f"{_emoji(self.bot, 'snuffedcandle')} {_nm(interaction.user)} cancelled the scheduled sprint **{row['title']}**."
         )
 
     @sprint_unschedule.autocomplete("sprint")
@@ -1959,8 +1806,8 @@ class Sprints(commands.Cog):
                 out.append(app_commands.Choice(name=label, value=str(r["id"])))
         return out[:25]
 
-    # The scheduler: opens a scheduled sprint's join window, converts pre-joiners to participants, and
-    # hands the sprint to the same lifecycle as /race start.
+    # The scheduler: opens a scheduled sprint's join window (a fresh join card + ping, like /race start) and
+    # hands the sprint to the same lifecycle.
 
     @tasks.loop(seconds=30)
     async def scheduler_tick(self):
@@ -2004,15 +1851,11 @@ class Sprints(commands.Cog):
             raise
 
     async def _post_missed(self, guild: discord.Guild, channel, row: dict):
-        settings = await self.bot.db.get_guild_config(guild.id)
-        librarian = settings.get("sprint_manager_role_id")
-        ping = f"<@&{librarian}> " if librarian else ""
         await self._close_scheduled_message(guild, row, "missed")
         await channel.send(
-            f"{ping}⚠️ **{row['title']}** was scheduled for "
+            f"⚠️ **{row['title']}** was scheduled for "
             f"{discord.utils.format_dt(_aware(row['start_time']), 'F')} but couldn't start — Griffin was busy or "
-            f"offline. Reschedule it with `/race schedule`.",
-            allowed_mentions=discord.AllowedMentions(roles=True),
+            f"offline. Reschedule it with `/race schedule`."
         )
 
     async def _activate_scheduled(self, guild: discord.Guild, channel, row: dict):
@@ -2023,6 +1866,7 @@ class Sprints(commands.Cog):
         end_time = start_time + timedelta(minutes=row["duration_minutes"])
         now = discord.utils.utcnow()
 
+        # Pre-joining is gone, but a sprint scheduled by an earlier version may still carry a pre-join list.
         prejoin_rows = await db.get_scheduled_participants(row["id"])
         participants = {}
         for p in prejoin_rows:
@@ -2030,14 +1874,14 @@ class Sprints(commands.Cog):
                 "type": p["type"], "title": p["title"], "start": _deserialize_start(p["type"], p["start_val"]),
                 "end": None, "joined_at": row["start_time"], "gg_awarded": False, "segments": [],
             }
-            if p.get("total_minutes"):
-                entry["total_minutes"] = p["total_minutes"]
+            if p.get("total_pages"):
+                entry["total_pages"] = p["total_pages"]
             participants[p["user_id"]] = entry
 
         sprint = {
             "host": row["host_id"], "channel": channel.id, "duration": row["duration_minutes"],
             "started_at": now, "start_time": start_time, "end_time": end_time, "role_id": role_id,
-            "participants": participants, "join_message_id": row["message_id"], "started": False,
+            "participants": participants, "join_message_id": None, "started": False,
             "title": row["title"], "description": row["description"], "scheduled_id": row["id"],
         }
         active_sprints[guild.id] = sprint        # claim the guild before any await below can be interleaved
@@ -2045,12 +1889,11 @@ class Sprints(commands.Cog):
         await db.save_active_sprint(
             guild.id, row["host_id"], channel.id, row["duration_minutes"], now, end_time, role_id,
             title=row["title"], description=row["description"], scheduled_id=row["id"],
-            join_message_id=row["message_id"],
         )
         for p in prejoin_rows:
             await db.save_sprint_participant(
                 guild.id, p["user_id"], p["type"], p["title"], p["start_val"],
-                joined_at=row["start_time"], total_minutes=p.get("total_minutes"),
+                joined_at=row["start_time"], total_pages=p.get("total_pages"),
             )
 
         host = guild.get_member(row["host_id"])
@@ -2058,22 +1901,16 @@ class Sprints(commands.Cog):
             guild, start_time, end_time, host.display_name if host else "Unknown", row["duration_minutes"],
             title=row["title"], description=row["description"],
         )
-        try:      # swap the Pre-Join message over to the live sprint in place
-            msg = await channel.fetch_message(row["message_id"])
-            await msg.edit(content=None, embeds=embeds, view=JoinSprintView(self))
-        except Exception:
-            msg = await channel.send(embeds=embeds, view=JoinSprintView(self))
-            sprint["join_message_id"] = msg.id
-            await db.update_sprint_message_id(guild.id, msg.id)
-
-        # Edits never notify, so the go-live ping is its own message.
-        mentions = ([f"<@&{role_id}>"] if role_id else []) + [f"<@{uid}>" for uid in participants]
-        notice = " ".join(mentions) + "\n" if mentions else ""
-        await channel.send(
-            f"{notice}{_emoji(self.bot, 'litcandle')} **{row['title']}** is open for joining — focus time starts "
-            f"{discord.utils.format_dt(start_time, 'R')}. [Jump to the sprint]({msg.jump_url})",
-            allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+        # The join card goes up as its own *new* message, exactly like /race start, with the Page Racers ping
+        # on top (an edit would never notify). The small "scheduled" notice is then marked as open.
+        role_mention = f"<@&{role_id}>" if role_id else ""
+        msg = await channel.send(
+            content=_created_text(start_time, role_mention), embeds=embeds, view=JoinSprintView(self),
+            allowed_mentions=discord.AllowedMentions(roles=True),
         )
+        sprint["join_message_id"] = msg.id
+        await db.update_sprint_message_id(guild.id, msg.id)
+        await self._close_scheduled_message(guild, row, "started")
         self._spawn(self._run_sprint_lifecycle(guild, sprint))
 
     # ── /race edit ────────────────────────────────────────────────────────────
@@ -2155,6 +1992,7 @@ class Sprints(commands.Cog):
                     "end": _deserialize_end(p["type"], p["end_val"]),
                     "segments": _parse_segments(p.get("segments")),
                     "total_minutes": p.get("total_minutes"),
+                    "total_pages": p.get("total_pages"),
                 }
 
         deadline = discord.utils.utcnow() + timedelta(minutes=LOG_WINDOW_MINUTES)
@@ -2205,6 +2043,7 @@ class Sprints(commands.Cog):
                 "resumed_at": p.get("resumed_at"),
                 "segments": _parse_segments(p.get("segments")),
                 "total_minutes": p.get("total_minutes"),
+                "total_pages": p.get("total_pages"),
             }
         for uid, data in sprint["participants"].items():
             if data["end"] is not None:
@@ -2213,6 +2052,8 @@ class Sprints(commands.Cog):
                 final_participants[uid]["segments"] = data.get("segments", [])
                 if data.get("total_minutes"):
                     final_participants[uid]["total_minutes"] = data["total_minutes"]
+                if data.get("total_pages"):
+                    final_participants[uid]["total_pages"] = data["total_pages"]
                 if data.get("joined_at") and not final_participants[uid].get("joined_at"):
                     final_participants[uid]["joined_at"] = data["joined_at"]
                 if data.get("gg_awarded"):
@@ -2250,8 +2091,16 @@ class Sprints(commands.Cog):
 
         results.sort(key=lambda r: r[1], reverse=True)
 
-        librarian_role_id = (await self.bot.db.get_guild_config(guild_id)).get("sprint_manager_role_id")
-        librarian_mention = f"<@&{librarian_role_id}> " if librarian_role_id else ""
+        cfg = await self.bot.db.get_guild_config(guild_id)
+        librarian_role_id = cfg.get("sprint_manager_role_id")
+        # Pinging the librarian role on every results board is opt-in (/staff race librarian-ping), e.g. readathons.
+        librarian_mention = f"<@&{librarian_role_id}> " if librarian_role_id and cfg.get("sprint_librarian_ping") else ""
+
+        if silent_gg_uids and gg > 0:       # said before the board so the results are always the last word
+            names = ", ".join(_uname(guild, uid) for uid in silent_gg_uids)
+            await channel.send(
+                f"{names} — you updated your progress during the sprint and earned **{gg} GG**! 📚"
+            )
 
         if results:
             medals = ["🥇", "🥈", "🥉"]
@@ -2263,7 +2112,7 @@ class Sprints(commands.Cog):
                 lines.append(f"{prefix} **{name}** — +{pages} pages{suffix}{dur}")
             embeds = _paginate_lines(
                 lines, "🏁 Griffin has recorded the sprint results…",
-                header=f"**{sprint['title']}**" if sprint.get("title") else None,
+                header=f"### {sprint['title']}" if sprint.get("title") else None,
             )
             if gg > 0:
                 for e in embeds:
@@ -2272,12 +2121,6 @@ class Sprints(commands.Cog):
             await channel.send(content=librarian_mention or None, embed=embeds[0], view=view)
         else:
             await channel.send(f"{librarian_mention}No one logged their results. 📭")
-
-        if silent_gg_uids and gg > 0:
-            mentions = " ".join(f"<@{uid}>" for uid in silent_gg_uids)
-            await channel.send(
-                f"{mentions} — you updated your progress during the sprint and earned **{gg} GG**! 📚"
-            )
 
         sprint_id = await self.bot.db.create_sprint(
             guild_id, sprint["channel"], sprint["host"], sprint["started_at"], sprint_end_time, sprint["duration"],
@@ -2389,10 +2232,16 @@ class SprintLogSelectView(SafeView):
         self.delete_btn.callback = self._on_delete
         self.add_item(self.delete_btn)
 
+        self.finish_btn = discord.ui.Button(label="✅ Mark book finished", style=discord.ButtonStyle.success,
+                                            disabled=True)
+        self.finish_btn.callback = self._on_finish
+        self.add_item(self.finish_btn)
+
     async def _on_select(self, interaction: discord.Interaction):
         self._selected = interaction.data["values"][0]
         self.edit_btn.disabled = False
         self.delete_btn.disabled = False
+        self.finish_btn.disabled = not self.logs[self._selected]["title"]
         await interaction.response.edit_message(view=self)
 
     async def _on_edit(self, interaction: discord.Interaction):
@@ -2402,6 +2251,18 @@ class SprintLogSelectView(SafeView):
             row["start_count"] or 0, row["end_count"] or 0, row["type"], self.guild_id
         )
         await interaction.response.send_modal(modal)
+
+    async def _on_finish(self, interaction: discord.Interaction):
+        row = self.logs[self._selected]
+        # A log that spanned a Switch Books is titled "A & B": each is its own book.
+        books = [t.strip() for t in (row["title"] or "").split(" & ") if t.strip()]
+        for book in books:
+            await self.bot.db.set_book_finished(interaction.user.id, self.guild_id, book, True)
+        names = ", ".join(f"**{b}**" for b in books)
+        await interaction.response.send_message(
+            f"✅ Marked {names} as finished — it won't show in your list of recent books. "
+            f"Join with the title again any time to bring it back.", ephemeral=True
+        )
 
     async def _on_delete(self, interaction: discord.Interaction):
         row = self.logs[self._selected]
