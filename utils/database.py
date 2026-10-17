@@ -223,6 +223,8 @@ class Database:
         await self._execute("ALTER TABLE scheduled_sprint_participants ADD COLUMN IF NOT EXISTS total_pages INTEGER;")
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS last_used TIMESTAMP;")
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS finished BOOLEAN DEFAULT FALSE;")
+        await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS last_type TEXT;")
+        await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS last_pos DOUBLE PRECISION;")
 
     # --- members / GG ---
     # GG is purely cosmetic (rank + bragging rights) — nothing spends it, so
@@ -372,7 +374,7 @@ class Database:
             DO UPDATE SET assets_channel_id = %s
         """, guild_id, channel_id, channel_id)
 
-    async def set_sprint_channel(self, guild_id: int, channel_id: int):
+    async def set_sprint_channel(self, guild_id: int, channel_id):          # None clears the restriction
         await self._execute("""
             INSERT INTO guild_config (guild_id, sprint_channel_id)
             VALUES (%s, %s)
@@ -566,32 +568,53 @@ class Database:
         """, guild_id, user_id, limit)
 
     async def get_recent_sprint_titles(self, guild_id: int, user_id: int, limit: int = 5) -> list:
-        """The person's most recent books (individual titles), newest first, minus any marked finished.
-        Joined/switched books are tracked in sprint_book_meta; older logged sprints fill in the history
-        from before that (combined 'A & B' log titles are skipped, they aren't one book)."""
+        """The person's most recent books (individual titles), newest first, minus any marked finished, each
+        with how it was last tracked ('pages' / 'audio_pct'). Joined/switched books live in sprint_book_meta;
+        older logged sprints fill in the history from before that (combined 'A & B' log titles are skipped,
+        they aren't one book)."""
         return await self._fetchall("""
-            SELECT title, MAX(last_used) AS last_used FROM (
-                SELECT m.title, m.last_used
-                FROM sprint_book_meta m
-                WHERE m.guild_id=%s AND m.user_id=%s
-                UNION ALL
-                SELECT sp.title, sp.sprint_end_time
-                FROM sprint_participants sp
-                JOIN sprints s ON s.id = sp.sprint_id
-                WHERE s.guild_id=%s AND sp.user_id=%s AND sp.title IS NOT NULL AND sp.title NOT LIKE '%% & %%'
-            ) u
-            WHERE title NOT IN (
-                SELECT title FROM sprint_book_meta WHERE guild_id=%s AND user_id=%s AND finished
+            SELECT title, last_used, last_type FROM (
+                SELECT DISTINCT ON (LOWER(title)) title, last_used, last_type FROM (
+                    SELECT m.title, m.last_used, m.last_type
+                    FROM sprint_book_meta m
+                    WHERE m.guild_id=%s AND m.user_id=%s
+                    UNION ALL
+                    SELECT sp.title, sp.sprint_end_time, sp.type
+                    FROM sprint_participants sp
+                    JOIN sprints s ON s.id = sp.sprint_id
+                    WHERE s.guild_id=%s AND sp.user_id=%s AND sp.title IS NOT NULL AND sp.title NOT LIKE '%% & %%'
+                ) u
+                ORDER BY LOWER(title), last_used DESC NULLS LAST
+            ) d
+            WHERE LOWER(title) NOT IN (
+                SELECT LOWER(title) FROM sprint_book_meta WHERE guild_id=%s AND user_id=%s AND finished
             )
-            GROUP BY title
-            ORDER BY MAX(last_used) DESC NULLS LAST
+            ORDER BY last_used DESC NULLS LAST
             LIMIT %s
         """, guild_id, user_id, guild_id, user_id, guild_id, user_id, limit)
 
     async def get_sprint_book_meta(self, user_id: int, guild_id: int, title: str) -> Optional[dict]:
         return await self._fetchone(
-            "SELECT * FROM sprint_book_meta WHERE user_id=%s AND guild_id=%s AND title=%s",
+            "SELECT * FROM sprint_book_meta WHERE user_id=%s AND guild_id=%s AND LOWER(title)=LOWER(%s) "
+            "ORDER BY last_used DESC NULLS LAST LIMIT 1",
             user_id, guild_id, title
+        )
+
+    async def _book_title(self, user_id: int, guild_id: int, title: str) -> str:
+        """Typing 'dune' for a book saved as 'Dune' is the same book: reuse the saved spelling."""
+        row = await self.get_sprint_book_meta(user_id, guild_id, title)
+        return row["title"] if row else title
+
+    async def set_book_progress(self, user_id: int, guild_id: int, title: str, ptype: str, position):
+        """Where they got to in this book and whether they tracked it by pages or audio %, so the next
+        sprint can pick up from there."""
+        title = await self._book_title(user_id, guild_id, title)
+        await self._execute(
+            """INSERT INTO sprint_book_meta (user_id, guild_id, title, last_type, last_pos, last_used, finished)
+               VALUES (%s,%s,%s,%s,%s,(NOW() AT TIME ZONE 'UTC'),FALSE)
+               ON CONFLICT (user_id, guild_id, title)
+               DO UPDATE SET last_type = %s, last_pos = %s""",
+            user_id, guild_id, title, ptype, float(position), ptype, float(position)
         )
 
     async def save_sprint_book_meta(self, user_id: int, guild_id: int, title: str,

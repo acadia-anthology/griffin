@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import time
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -10,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from utils import cards, levels
+from utils.emojis import _FALLBACKS
 
 VOICE_TICK_MINUTES = 5
 
@@ -549,6 +551,24 @@ class LevelsGroup(GriffinModGroup):
             await interaction.response.send_message(f"✅ **{tier.name}** cleared — back to the default name.")
 
 
+_CHANNEL_REF = re.compile(r"discord(?:app)?\.com/channels/\d+/(\d+)|<#(\d+)>|(\d{15,25})")
+
+
+async def _resolve_channel_ref(guild: discord.Guild, raw: str):
+    """A pasted channel / forum / thread ID, link or #mention -> the channel object, or None."""
+    m = _CHANNEL_REF.search(raw or "")
+    if not m:
+        return None
+    cid = int(next(g for g in m.groups() if g))
+    channel = guild.get_channel_or_thread(cid)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(cid)
+        except discord.HTTPException:
+            return None
+    return None if isinstance(channel, discord.CategoryChannel) else channel
+
+
 class ChannelSetGroup(GriffinModGroup):
     def __init__(self, db):
         super().__init__(name="channelset", description="Configure channels Griffin posts to")
@@ -566,11 +586,141 @@ class ChannelSetGroup(GriffinModGroup):
         await self.db.set_assets_channel(interaction.guild.id, channel.id)
         await interaction.response.send_message(f"✅ Card art will be archived in {channel.mention}.")
 
-    @app_commands.command(name="sprint", description="Restrict /race start to a single channel (optional).")
-    @app_commands.describe(channel="Channel where sprints can be started")
-    async def sprint(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await self.db.set_sprint_channel(interaction.guild.id, channel.id)
-        await interaction.response.send_message(f"✅ Sprints can now only be started in {channel.mention}.")
+    @app_commands.command(
+        name="sprint", description="Choose where sprints can run: a channel, forum or thread (optional)."
+    )
+    @app_commands.describe(channel="Paste a channel, forum or thread ID/link (blank = allow anywhere)")
+    async def sprint(self, interaction: discord.Interaction, channel: str = None):
+        if not (channel or "").strip():
+            await self.db.set_sprint_channel(interaction.guild.id, None)
+            await interaction.response.send_message("✅ Sprints can now be started in any channel.")
+            return
+        target = await _resolve_channel_ref(interaction.guild, channel)
+        if target is None:
+            await interaction.response.send_message(
+                "❌ I couldn't find that. Paste a channel, forum or thread **ID**, a message/channel **link**, or "
+                "a #mention (in Discord: right-click it → Copy ID, with Developer Mode on).", ephemeral=True
+            )
+            return
+        await self.db.set_sprint_channel(interaction.guild.id, target.id)
+        if isinstance(target, discord.ForumChannel):
+            where = f"in any post in the {target.mention} forum"
+        elif isinstance(target, discord.Thread):
+            where = f"only in the thread {target.mention}"
+        else:
+            where = f"only in {target.mention} (and threads inside it)"
+        await interaction.response.send_message(f"✅ Sprints can now be started and scheduled {where}.")
+
+
+class RemoveEmojiView(discord.ui.View):
+    def __init__(self, owner_id: int, emoji: discord.Emoji, registry: dict, used_by_griffin: bool):
+        super().__init__(timeout=60)
+        self.owner_id, self.emoji, self.registry, self.used = owner_id, emoji, registry, used_by_griffin
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, remove it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self.emoji.delete()
+        except discord.HTTPException as e:
+            await interaction.response.edit_message(content=f"❌ Discord wouldn't remove it: {e}", view=None)
+            return
+        self.registry.pop(self.emoji.name, None)
+        note = (" Griffin will use a basic emoji in its place until you upload one with the same name."
+                if self.used else "")
+        await interaction.response.edit_message(content=f"🗑️ Removed `{self.emoji.name}`.{note}", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Kept it.", view=None)
+        self.stop()
+
+
+class EmojiGroup(GriffinModGroup):
+    """Upload / remove the emojis Griffin itself owns (they're shared everywhere Griffin is)."""
+    MAX_BYTES = 256 * 1024
+
+    def __init__(self, db):
+        super().__init__(name="emoji", description="Upload or remove the emojis Griffin uses")
+        self.db = db
+
+    @app_commands.command(name="add", description="Upload a new emoji for Griffin to use.")
+    @app_commands.describe(
+        name="Letters, numbers and underscores. Use a name Griffin already expects to give it a new look",
+        image="PNG, JPG or GIF, under 256 KB",
+    )
+    async def add(self, interaction: discord.Interaction, name: str, image: discord.Attachment):
+        registry = interaction.client.app_emojis
+        name = name.strip().strip(":")
+        if not re.fullmatch(r"[A-Za-z0-9_]{2,32}", name):
+            await interaction.response.send_message(
+                "❌ The name needs 2–32 letters, numbers or underscores (no spaces).", ephemeral=True)
+            return
+        if name in registry:
+            await interaction.response.send_message(
+                f"❌ There's already an emoji called `{name}`. Remove it first with `/staff emoji remove`, "
+                f"or pick another name.", ephemeral=True)
+            return
+        if (image.content_type or "").split(";")[0] not in ("image/png", "image/jpeg", "image/gif"):
+            await interaction.response.send_message("❌ That needs to be a PNG, JPG or GIF.", ephemeral=True)
+            return
+        if image.size > self.MAX_BYTES:
+            await interaction.response.send_message(
+                f"❌ That file is {image.size // 1024} KB. Emojis have to be under 256 KB.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            data = await image.read()
+            emoji = await interaction.client.create_application_emoji(name=name, image=data)
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ Discord wouldn't take that emoji: {e}", ephemeral=True)
+            return
+        registry[emoji.name] = emoji
+        note = "" if emoji.name in _FALLBACKS else " (Griffin doesn't use this name yet; it's stored for later.)"
+        await interaction.followup.send(f"✅ Added {emoji} as `{emoji.name}`.{note}")
+
+    @app_commands.command(name="remove", description="Remove one of Griffin's emojis.")
+    @app_commands.describe(name="Which emoji to remove")
+    async def remove(self, interaction: discord.Interaction, name: str):
+        registry = interaction.client.app_emojis
+        emoji = registry.get(name.strip().strip(":"))
+        if emoji is None:
+            await interaction.response.send_message(
+                f"❌ I don't have an emoji called `{name}`. Use `/staff emoji list` to see them.", ephemeral=True)
+            return
+        used = emoji.name in _FALLBACKS
+        warn = (" Griffin uses this one in its sprint messages, so it'll fall back to a basic emoji until you "
+                "upload a replacement with the same name.") if used else ""
+        await interaction.response.send_message(
+            f"Remove {emoji} `{emoji.name}` for good?{warn}",
+            view=RemoveEmojiView(interaction.user.id, emoji, registry, used), ephemeral=True)
+
+    @remove.autocomplete("name")
+    async def _remove_autocomplete(self, interaction: discord.Interaction, current: str):
+        names = sorted(interaction.client.app_emojis)
+        return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
+
+    @app_commands.command(name="list", description="See Griffin's emojis and which ones it's missing.")
+    async def list_(self, interaction: discord.Interaction):
+        registry = interaction.client.app_emojis
+        lines = [f"{e} `{n}`" + (" — used by Griffin" if n in _FALLBACKS else "")
+                 for n, e in sorted(registry.items())]
+        missing = [n for n in _FALLBACKS if n not in registry]
+        text = "\n".join(lines) or "No emojis uploaded yet."
+        if len(text) > 3500:
+            text = text[:3500].rsplit("\n", 1)[0] + "\n…and more"
+        if missing:
+            text += ("\n\n**Griffin expects these but doesn't have them** (using a basic emoji): "
+                     + ", ".join(f"`{n}`" for n in missing))
+        await interaction.response.send_message(
+            embed=discord.Embed(title=f"Griffin's emojis ({len(registry)})", description=text,
+                                color=discord.Color(0x26878D)), ephemeral=True)
 
 
 class RaceConfigGroup(GriffinModGroup):
@@ -730,6 +880,7 @@ class StaffGroup(GriffinModGroup):
         self.db = db
         self.add_command(ChannelSetGroup(db))
         self.add_command(RaceConfigGroup(db))
+        self.add_command(EmojiGroup(db))
 
     @app_commands.command(
         name="manager-role",
@@ -777,7 +928,9 @@ class StaffGroup(GriffinModGroup):
                 "announcements",
                 "**/staff channelset assets** `<channel>` — Set the channel uploaded card art "
                 "gets archived to",
-                "**/staff channelset sprint** `<channel>` — Restrict `/race start` to a single channel",
+                "**/staff channelset sprint** `<id or link>` — Restrict sprints to a channel, forum or "
+                "thread (paste its ID); leave blank to allow anywhere",
+                "**/staff emoji add|remove|list** — Upload, remove or review the emojis Griffin uses",
                 "**/race schedule** — Schedule a sprint ahead of time (one at a time). Start with a time "
                 "like `14:30` (your own timezone, asked once) or a countdown like `in 1h30m`. A small notice "
                 "goes up now; the join card and Page Racers ping go up 5 minutes before it starts",

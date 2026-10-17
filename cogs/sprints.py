@@ -138,6 +138,13 @@ def _aware(dt):
     return dt
 
 
+def _in_sprint_channel(interaction: discord.Interaction, sprint_channel_id: int) -> bool:
+    """True if this is the configured channel, a thread/forum post inside it, or the configured thread itself
+    (forum posts are threads, so setting a forum allows every post in it)."""
+    channel = interaction.channel
+    return channel.id == sprint_channel_id or getattr(channel, "parent_id", None) == sprint_channel_id
+
+
 def _created_text(start_time, role_mention: str = "") -> str:
     """The line that goes with the Page Racers ping when a sprint opens for joining."""
     line = f"### A sprint has been created for {discord.utils.format_dt(start_time, 'F')}, time to focus!"
@@ -462,8 +469,8 @@ class JoinSprintModal(SafeModal):
             placeholder="Only if it isn't in the list above" if self.recent else "What are you reading?",
         )
         self.add_item(discord.ui.Label(text="New book name" if self.recent else "Book name", component=self.new_title))
-        self.start_input = discord.ui.TextInput(default="0", max_length=10, placeholder="e.g. 42, or 24 for 24%")
-        self.add_item(discord.ui.Label(text="Starting page (or % for audio)", component=self.start_input))
+        self.start_input = discord.ui.TextInput(required=False, max_length=10, placeholder="e.g. 42, or 24 for 24%")
+        self.add_item(discord.ui.Label(text="Start page or % (blank = where you left off)", component=self.start_input))
         self.total_pages = discord.ui.TextInput(required=False, max_length=6, placeholder="Audiobooks only, e.g. 352")
         self.add_item(discord.ui.Label(text="Book's total pages (for audio %)", component=self.total_pages))
 
@@ -483,17 +490,33 @@ class JoinSprintModal(SafeModal):
         if ptype == "audio_pct" and not title:
             await self._fail(interaction, "Pick a recent book or type the audiobook's name.")
             return
-        raw_start = (self.start_input.value or "0").strip() or "0"
-        try:
-            start = int(raw_start) if ptype == "pages" else float(raw_start.replace("%", "").strip())
-        except ValueError:
-            await self._fail(interaction, "Your starting " + ("page" if ptype == "pages" else "percentage")
-                             + " needs to be a number.")
-            return
-        if start < 0 or (ptype == "audio_pct" and start > 100):
-            await self._fail(interaction, "That starting " + ("page" if ptype == "pages" else "percentage")
-                             + " doesn't look right.")
-            return
+        meta = await db.get_sprint_book_meta(uid, guild_id, title) if title else None
+        raw_start = (self.start_input.value or "").strip()
+        resumed = False
+        if raw_start:
+            try:
+                start = int(raw_start) if ptype == "pages" else float(raw_start.replace("%", "").strip())
+            except ValueError:
+                await self._fail(interaction, "Your starting " + ("page" if ptype == "pages" else "percentage")
+                                 + " needs to be a number.")
+                return
+            if start < 0 or (ptype == "audio_pct" and start > 100):
+                await self._fail(interaction, "That starting " + ("page" if ptype == "pages" else "percentage")
+                                 + " doesn't look right.")
+                return
+        elif meta and meta.get("last_pos") is not None:         # blank: pick up where they left off
+            was_audio = str(meta.get("last_type") or ptype).startswith("audio")
+            if was_audio != (ptype == "audio_pct"):
+                await self._fail(
+                    interaction,
+                    f"Last time you tracked **{meta['title']}** by {'audio %' if was_audio else 'pages'}. Switch "
+                    f"**Tracking by** to match, or type where you're starting."
+                )
+                return
+            start = float(meta["last_pos"]) if ptype == "audio_pct" else int(round(meta["last_pos"]))
+            resumed = True
+        else:
+            start = 0 if ptype == "pages" else 0.0
         total_pages = None
         if ptype == "audio_pct":
             raw_total = (self.total_pages.value or "").strip()
@@ -506,7 +529,6 @@ class JoinSprintModal(SafeModal):
                     await self._fail(interaction, "The book's total pages needs to be a whole number, like `352`.")
                     return
             else:
-                meta = await db.get_sprint_book_meta(uid, guild_id, title)
                 total_pages = (meta or {}).get("total_pages")
                 if not total_pages:
                     await self._fail(
@@ -519,6 +541,7 @@ class JoinSprintModal(SafeModal):
         icon = _emoji(interaction.client, "headphones" if ptype == "audio_pct" else "blankbook")
         stamp = _emoji(interaction.client, "librarystamp")
         what = (f" — listening to **{title}**" if ptype == "audio_pct" else (f" — reading **{title}**" if title else ""))
+        left_off = " *(where you left off)*" if resumed else ""
 
         sprint = active_sprints.get(guild_id)
         if not sprint:
@@ -552,7 +575,7 @@ class JoinSprintModal(SafeModal):
                 await db.save_sprint_book_meta(uid, guild_id, title, total_pages=total_pages)
             await interaction.response.send_message(
                 f"{_emoji(interaction.client, 'bookswap')} {_nm(interaction.user)} switched to "
-                f"**{title or 'a new book'}** — tracking continues!", ephemeral=False)
+                f"**{title or 'a new book'}** — tracking continues!{left_off}", ephemeral=False)
             await self.cog._update_join_embed(interaction.guild)
             return
 
@@ -579,7 +602,7 @@ class JoinSprintModal(SafeModal):
         sprint["participants"][uid] = entry
         (sprint.get("carry") or {}).pop(uid, None)
         await interaction.response.send_message(
-            f"{stamp} {_nm(interaction.user)} joined at {icon} **{start_str}**{what}!", ephemeral=False)
+            f"{stamp} {_nm(interaction.user)} joined at {icon} **{start_str}**{what}!{left_off}", ephemeral=False)
         await self.cog._update_join_embed(interaction.guild)
 
 
@@ -762,6 +785,8 @@ class SwitchBookOldModal(SafeModal):
         data["pending_segment"] = (old_title, gained)
         data["end"] = end_val
         await interaction.client.db.update_sprint_participant_end(guild_id, uid, str(end_val))
+        if data.get("title"):
+            await interaction.client.db.set_book_progress(uid, guild_id, data["title"], self.ptype, end_val)
         await interaction.response.send_message(
             f"{_progress_message(interaction.client, interaction.user, gained)}\n"
             f"📚 **{old_title}** gets saved at +{gained} pages once you enter your next book — "
@@ -832,6 +857,9 @@ class ResumeOrFreshView(SafeView):
                     gained = _leg_pages(data, data["end"])
                     if gained > 0:
                         segments.append((data.get("title") or "", gained))
+                    if data.get("title"):
+                        await interaction.client.db.set_book_progress(
+                            uid, guild_id, data["title"], data["type"], data["end"])
                 banked = 0
                 for row in await interaction.client.db.get_sprint_participants(guild_id):
                     if row["user_id"] == uid:
@@ -1447,7 +1475,7 @@ class Sprints(commands.Cog):
 
         settings = await self.bot.db.get_guild_config(guild_id)
         sprint_channel_id = settings.get("sprint_channel_id")
-        if sprint_channel_id and interaction.channel.id != sprint_channel_id:
+        if sprint_channel_id and not _in_sprint_channel(interaction, sprint_channel_id):
             await interaction.response.send_message(
                 f"❌ Sprints can only be started in <#{sprint_channel_id}>.", ephemeral=True
             )
@@ -1622,6 +1650,8 @@ class Sprints(commands.Cog):
                                default_type: str = "pages"):
         """Opens the one-step join form straight from a button, with the person's last 3 books to pick from."""
         rows = await self.bot.db.get_recent_sprint_titles(interaction.guild.id, interaction.user.id, limit=3)
+        if rows and not switch:         # start on however they tracked their latest book (pages or audio %)
+            default_type = "audio_pct" if str(rows[0].get("last_type") or "").startswith("audio") else "pages"
         await interaction.response.send_modal(JoinSprintModal(
             self, [r["title"] for r in rows], switch=switch, default_type=default_type))
 
@@ -1688,7 +1718,7 @@ class Sprints(commands.Cog):
     async def sprint_schedule(self, interaction: discord.Interaction):
         settings = await self.bot.db.get_guild_config(interaction.guild.id)
         sprint_channel_id = settings.get("sprint_channel_id")
-        if sprint_channel_id and interaction.channel.id != sprint_channel_id:
+        if sprint_channel_id and not _in_sprint_channel(interaction, sprint_channel_id):
             await interaction.response.send_message(
                 f"❌ Sprints can only be scheduled in <#{sprint_channel_id}>.", ephemeral=True
             )
@@ -2068,6 +2098,13 @@ class Sprints(commands.Cog):
                 await _award_sprint_gg(self.bot, guild, uid, gg)
                 data["gg_awarded"] = True
                 silent_gg_uids.append(uid)
+
+        for uid, data in final_participants.items():      # remember where each person got to in their book
+            if data["end"] is not None and data.get("title"):
+                try:
+                    await self.bot.db.set_book_progress(uid, guild_id, data["title"], data["type"], data["end"])
+                except Exception:
+                    traceback.print_exc()
 
         def _duration_str(active_seconds, resumed_at, end_time):
             total_seconds = active_seconds or 0
