@@ -16,6 +16,11 @@ _FALLBACKS = {
     "inkandquill": "🖋️",
     "librarystamp": "📮",
     "griffinsleepy": "🧌",
+    "books": "📚",
+    "checkered_flag": "🏁",
+    "first_place": "🥇",
+    "second_place": "🥈",
+    "third_place": "🥉",
 }
 
 

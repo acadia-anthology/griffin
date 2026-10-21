@@ -145,6 +145,16 @@ def _in_sprint_channel(interaction: discord.Interaction, sprint_channel_id: int)
     return channel.id == sprint_channel_id or getattr(channel, "parent_id", None) == sprint_channel_id
 
 
+def _use_book_stack(view: discord.ui.View, bot, *buttons) -> None:
+    """Puts Griffin's book-stack emoji on these buttons (their labels keep just the words)."""
+    custom = getattr(bot, "app_emojis", {}).get("books")
+    stack = (discord.PartialEmoji(name=custom.name, id=custom.id, animated=getattr(custom, "animated", False))
+             if custom else discord.PartialEmoji(name="📚"))
+    for b in buttons:
+        b.emoji = stack
+        b.label = (b.label or "").removeprefix("📚 ")
+
+
 def _created_text(start_time, role_mention: str = "") -> str:
     """The line that goes with the Page Racers ping when a sprint opens for joining."""
     line = f"### A sprint has been created for {discord.utils.format_dt(start_time, 'F')}, time to focus!"
@@ -789,7 +799,7 @@ class SwitchBookOldModal(SafeModal):
             await interaction.client.db.set_book_progress(uid, guild_id, data["title"], self.ptype, end_val)
         await interaction.response.send_message(
             f"{_progress_message(interaction.client, interaction.user, gained)}\n"
-            f"📚 **{old_title}** gets saved at +{gained} pages once you enter your next book — "
+            f"{_emoji(interaction.client, 'books')} **{old_title}** gets saved at +{gained} pages once you enter your next book — "
             f"hit the button below.",
             view=SwitchBookContinueView(self.cog, self.ptype, uid),
             ephemeral=False
@@ -802,6 +812,7 @@ class SwitchBookContinueView(SafeView):
         self.cog = cog
         self.ptype = ptype
         self.owner_id = owner_id
+        _use_book_stack(self, cog.bot, self.continue_btn)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -829,6 +840,7 @@ class ResumeOrFreshView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=60)
         self.cog = cog
+        _use_book_stack(self, cog.bot, self.fresh_btn)
 
     @discord.ui.button(label="▶️ Resume (same book)", style=discord.ButtonStyle.success)
     async def resume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -872,6 +884,7 @@ class JoinSprintView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
+        _use_book_stack(self, cog.bot, self.switch_btn)
 
     @discord.ui.button(label="📖 Join Sprint", style=discord.ButtonStyle.success, custom_id="sprint_join_btn", row=0)
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2136,11 +2149,11 @@ class Sprints(commands.Cog):
         if silent_gg_uids and gg > 0:       # said before the board so the results are always the last word
             names = ", ".join(_uname(guild, uid) for uid in silent_gg_uids)
             await channel.send(
-                f"{names} — you updated your progress during the sprint and earned **{gg} GG**! 📚"
+                f"{names} — you updated your progress during the sprint and earned **{gg} GG**! {_emoji(self.bot, 'books')}"
             )
 
         if results:
-            medals = ["🥇", "🥈", "🥉"]
+            medals = [_emoji(self.bot, "first_place"), _emoji(self.bot, "second_place"), _emoji(self.bot, "third_place")]
             lines = []
             for i, (name, pages, title, duration) in enumerate(results):
                 suffix = f" — *{title}*" if title else ""
@@ -2148,7 +2161,7 @@ class Sprints(commands.Cog):
                 dur = f" ({duration})" if duration else ""
                 lines.append(f"{prefix} **{name}** — +{pages} pages{suffix}{dur}")
             embeds = _paginate_lines(
-                lines, "🏁 Griffin has recorded the sprint results…",
+                lines, f"{_emoji(self.bot, 'checkered_flag')} Griffin has recorded the sprint results…",
                 header=f"### {sprint['title']}" if sprint.get("title") else None,
             )
             if gg > 0:
