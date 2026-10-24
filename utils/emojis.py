@@ -27,6 +27,7 @@ _FALLBACKS = {
     "update": "🔄",
     "leavesprint": "🚪",
     "bargraph": "📊",
+    "raceleaderboard": "🏆",
 }
 
 

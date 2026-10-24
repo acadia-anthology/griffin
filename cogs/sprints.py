@@ -2028,7 +2028,7 @@ class Sprints(commands.Cog):
                 f"{sprints} Sprint{'s' if sprints != 1 else ''} | "
                 f"Total Pages Logged: {total_pages:,}{gg_part}"
             )
-        embeds = _paginate_lines(lines, "🏆 Sprint Leaderboard")
+        embeds = _paginate_lines(lines, f"{_emoji(self.bot, 'raceleaderboard')} Sprint Leaderboard")
         view = EmbedPaginatorView(embeds) if len(embeds) > 1 else None
         await interaction.followup.send(embed=embeds[0], view=view)
 
