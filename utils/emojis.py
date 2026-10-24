@@ -21,6 +21,12 @@ _FALLBACKS = {
     "first_place": "🥇",
     "second_place": "🥈",
     "third_place": "🥉",
+    "tools": "🛠️",
+    "logpages": "📝",
+    "joinsprint": "📖",
+    "update": "🔄",
+    "leavesprint": "🚪",
+    "bargraph": "📊",
 }
 
 
@@ -40,3 +46,12 @@ def emoji(bot: discord.Client, name: str) -> str:
     if found:
         return str(found)
     return _FALLBACKS.get(name, "")
+
+
+def partial(bot: discord.Client, name: str):
+    """The same emoji as a PartialEmoji (what a button's `emoji=` needs), falling back to unicode."""
+    found = getattr(bot, "app_emojis", {}).get(name)
+    if found:
+        return discord.PartialEmoji(name=found.name, id=found.id, animated=getattr(found, "animated", False))
+    fallback = _FALLBACKS.get(name)
+    return discord.PartialEmoji(name=fallback) if fallback else None

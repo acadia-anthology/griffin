@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 
 from utils import cards, levels
 from utils.emoji_images import compress_emoji
-from utils.emojis import _FALLBACKS
+from utils.emojis import _FALLBACKS, emoji as _emoji
 
 VOICE_TICK_MINUTES = 5
 
@@ -874,7 +874,7 @@ class Economy(commands.Cog):
 @app_commands.command(name="help", description="Show what Griffin's commands can do.")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="📚 Patron Commands",
+        title=f"{_emoji(interaction.client, 'books')} Patron Commands",
         color=discord.Color.gold(),
         description="\n".join([
             "**/patron board** — Show the Goblin Gold leaderboard",
@@ -886,8 +886,6 @@ async def help_command(interaction: discord.Interaction):
             "**/race stats** `[member]` — View sprint stats for yourself or another member",
             "**/race leaderboard** — View the sprint leaderboard",
             "**/race edit** — Edit or delete one of your sprint logs",
-            "**/race scheduled** — See the upcoming scheduled sprints",
-            "**/race timezone** — Set your timezone, used to read the times you type when scheduling",
         ])
     )
     await interaction.response.send_message(embed=embed)
@@ -924,7 +922,7 @@ class StaffGroup(GriffinModGroup):
     @app_commands.command(name="help", description="Show what Griffin's staff commands can do.")
     async def help(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title="🛠️ Staff Commands",
+            title=f"{_emoji(interaction.client, 'tools')} Staff Commands",
             color=discord.Color.orange(),
             description="\n".join([
                 "**/staff manager-role** `<role>` — Set who can use every Griffin staff command "
@@ -953,6 +951,8 @@ class StaffGroup(GriffinModGroup):
                 "**/race schedule** — Schedule a sprint ahead of time (one at a time). Start with a time "
                 "like `14:30` (your own timezone, asked once) or a countdown like `in 1h30m`. A small notice "
                 "goes up now; the join card and Page Racers ping go up 5 minutes before it starts",
+                "**/race scheduled** — See the upcoming scheduled sprints",
+                "**/race timezone** — Set your timezone, used to read the times you type when scheduling",
                 "**/race unschedule** `<sprint>` — Cancel a scheduled sprint",
                 "**/race cancel** — Force-cancel the sprint that's running or collecting logs",
                 "**/race start** `Mod Test (5 min, no GG)` — A 5-minute practice sprint for testing (also offered in `/race schedule`); never awards GG",

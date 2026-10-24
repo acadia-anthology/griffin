@@ -10,7 +10,7 @@ import traceback
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from cogs.economy import _award_gg
-from utils.emojis import emoji as _emoji
+from utils.emojis import emoji as _emoji, partial as _partial_emoji
 
 LOG_WINDOW_MINUTES = 7
 TEST_SPRINT_MINUTES = 5         # "Mod Test": sprint managers only, never awards (or deducts) GG
@@ -145,14 +145,24 @@ def _in_sprint_channel(interaction: discord.Interaction, sprint_channel_id: int)
     return channel.id == sprint_channel_id or getattr(channel, "parent_id", None) == sprint_channel_id
 
 
-def _use_book_stack(view: discord.ui.View, bot, *buttons) -> None:
-    """Puts Griffin's book-stack emoji on these buttons (their labels keep just the words)."""
-    custom = getattr(bot, "app_emojis", {}).get("books")
-    stack = (discord.PartialEmoji(name=custom.name, id=custom.id, animated=getattr(custom, "animated", False))
-             if custom else discord.PartialEmoji(name="📚"))
-    for b in buttons:
-        b.emoji = stack
-        b.label = (b.label or "").removeprefix("📚 ")
+def _icon(bot, button: discord.ui.Button, name: str) -> None:
+    """Gives a button one of Griffin's custom emojis (or the unicode stand-in) and drops the emoji that was
+    typed into its label, so the label is just the words."""
+    button.emoji = _partial_emoji(bot, name)
+    label = button.label or ""
+    if " " in label and not label[0].isalnum():
+        button.label = label.split(" ", 1)[1]
+
+
+_SHORTCODE = re.compile(r":([A-Za-z0-9_]{2,32}):")
+
+
+def _expand_emoji(bot, text: str | None) -> str | None:
+    """Turns :name: typed into a title/description into Griffin's own emoji, when it has one by that name."""
+    if not text:
+        return text
+    emojis = getattr(bot, "app_emojis", {})
+    return _SHORTCODE.sub(lambda m: str(emojis[m.group(1)]) if m.group(1) in emojis else m.group(0), text)
 
 
 def _created_text(start_time, role_mention: str = "") -> str:
@@ -812,7 +822,7 @@ class SwitchBookContinueView(SafeView):
         self.cog = cog
         self.ptype = ptype
         self.owner_id = owner_id
-        _use_book_stack(self, cog.bot, self.continue_btn)
+        _icon(cog.bot, self.continue_btn, "books")
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -840,7 +850,7 @@ class ResumeOrFreshView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=60)
         self.cog = cog
-        _use_book_stack(self, cog.bot, self.fresh_btn)
+        _icon(cog.bot, self.fresh_btn, "books")
 
     @discord.ui.button(label="▶️ Resume (same book)", style=discord.ButtonStyle.success)
     async def resume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -884,7 +894,10 @@ class JoinSprintView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
-        _use_book_stack(self, cog.bot, self.switch_btn)
+        _icon(cog.bot, self.join_btn, "joinsprint")
+        _icon(cog.bot, self.update_btn, "update")
+        _icon(cog.bot, self.switch_btn, "books")
+        _icon(cog.bot, self.leave_btn, "leavesprint")
 
     @discord.ui.button(label="📖 Join Sprint", style=discord.ButtonStyle.success, custom_id="sprint_join_btn", row=0)
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -961,6 +974,7 @@ class LogProgressView(SafeView):
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
+        _icon(cog.bot, self.log_btn, "logpages")
 
     @discord.ui.button(label="📝 Log Sprint", style=discord.ButtonStyle.success, custom_id="sprint_log_btn", row=0)
     async def log_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1291,7 +1305,7 @@ class Sprints(commands.Cog):
             return
         participant_ids = [uid for uid, d in sprint["participants"].items() if not d.get("left")]
         mentions = " ".join(f"<@{uid}>" for uid in participant_ids) or None
-        title_line = f"### {sprint['title']}\n" if sprint.get("title") else ""
+        title_line = f"### {_expand_emoji(self.bot, sprint['title'])}\n" if sprint.get("title") else ""
         end_time = sprint["end_time"]
         start_embed = discord.Embed(
             description=(
@@ -1345,9 +1359,9 @@ class Sprints(commands.Cog):
 
         head = [f"## {_emoji(self.bot, 'announcement')} The Stacks Go Silent…"]
         if title:
-            head.append(f"### {title}")
+            head.append(f"### {_expand_emoji(self.bot, title)}")
         if description:
-            head.append(description)
+            head.append(_expand_emoji(self.bot, description))
         lines = [
             *head,
             "",
@@ -1603,9 +1617,9 @@ class Sprints(commands.Cog):
         join card (with the Page Racers ping) goes up as its own message when the join window opens."""
         start = _aware(row["start_time"])
         lines = [f"## {_emoji(self.bot, 'announcement')} A Community Sprint has been scheduled…",
-                 f"### {row['title']}"]
+                 f"### {_expand_emoji(self.bot, row['title'])}"]
         if row.get("description"):
-            lines.append(row["description"])
+            lines.append(_expand_emoji(self.bot, row["description"]))
         lines += [
             "",
             f"{_emoji(self.bot, 'litcandle')} **Starts:** {discord.utils.format_dt(start, 'F')} "
@@ -1980,14 +1994,14 @@ class Sprints(commands.Cog):
         pages = stats["total_pages"] or 0
         unlogged = int(stats["unlogged_sprints"] or 0)
 
-        embed = discord.Embed(title=f"📊 Sprint Stats — {member.display_name}", color=RACE_COLOR)
+        embed = discord.Embed(title=f"{_emoji(self.bot, 'bargraph')} Sprint Stats — {member.display_name}", color=RACE_COLOR)
         embed.add_field(name="Sprints Completed", value=str(stats["sprints_completed"] or 0))
         if pages:
-            embed.add_field(name="📖 Pages Read", value=f"{pages:,}")
+            embed.add_field(name=f"{_emoji(self.bot, 'blankbook')} Pages Read", value=f"{pages:,}")
         if gg_rate > 0:
             embed.add_field(name="GG Earned from Sprints", value=f"{gg_earned} GG")
         if unlogged:
-            embed.add_field(name="🫣 Unlogged Sprints", value=str(unlogged))
+            embed.add_field(name=f"{_emoji(self.bot, 'griffinlurk')} Unlogged Sprints", value=str(unlogged))
         await interaction.followup.send(embed=embed)
 
     # ── /race leaderboard ────────────────────────────────────────────────────
