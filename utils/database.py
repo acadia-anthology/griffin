@@ -225,6 +225,8 @@ class Database:
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS finished BOOLEAN DEFAULT FALSE;")
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS last_type TEXT;")
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS last_pos DOUBLE PRECISION;")
+        await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS status TEXT;")
+        await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP;")
 
     # --- members / GG ---
     # GG is purely cosmetic (rank + bragging rights) — nothing spends it, so
@@ -628,18 +630,52 @@ class Database:
                DO UPDATE SET
                  total_pages = COALESCE(%s, sprint_book_meta.total_pages),
                  last_used = (NOW() AT TIME ZONE 'UTC'),
-                 finished = FALSE""",
+                 finished = FALSE, status = NULL, finished_at = NULL""",
             user_id, guild_id, title, total_pages, total_pages
         )
 
-    async def set_book_finished(self, user_id: int, guild_id: int, title: str, finished: bool = True):
+    async def set_book_status(self, user_id: int, guild_id: int, title: str, status):
+        """status: 'completed', 'dnf', or None to put the book back to 'currently reading'. Completed and DNF
+        books drop off the recent-books list; none of this touches any sprint's page totals."""
+        if status not in (None, "completed", "dnf"):
+            raise ValueError(f"unknown book status {status!r}")
+        title = await self._book_title(user_id, guild_id, title)
+        finished = status is not None
         await self._execute(
-            """INSERT INTO sprint_book_meta (user_id, guild_id, title, finished)
-               VALUES (%s,%s,%s,%s)
+            """INSERT INTO sprint_book_meta (user_id, guild_id, title, finished, status, finished_at)
+               VALUES (%s,%s,%s,%s,%s,CASE WHEN %s THEN (NOW() AT TIME ZONE 'UTC') END)
                ON CONFLICT (user_id, guild_id, title)
-               DO UPDATE SET finished = %s""",
-            user_id, guild_id, title, finished, finished
+               DO UPDATE SET finished = %s, status = %s,
+                             finished_at = CASE WHEN %s THEN (NOW() AT TIME ZONE 'UTC') END""",
+            user_id, guild_id, title, finished, status, finished, finished, status, finished
         )
+
+    async def set_book_finished(self, user_id: int, guild_id: int, title: str, finished: bool = True):
+        await self.set_book_status(user_id, guild_id, title, "completed" if finished else None)
+
+    async def get_user_books(self, guild_id: int, user_id: int) -> list:
+        """Every book this person has sprinted with: title, status ('completed' / 'dnf' / None = reading),
+        and where they last got to. Older logged sprints fill in the books from before this was tracked
+        (combined 'A & B' log titles are skipped, they aren't one book)."""
+        return await self._fetchall("""
+            SELECT title, status, last_used, last_type, last_pos, finished_at FROM (
+                SELECT DISTINCT ON (LOWER(title)) title, status, last_used, last_type, last_pos, finished_at FROM (
+                    SELECT m.title,
+                           CASE WHEN m.finished THEN COALESCE(m.status, 'completed') END AS status,
+                           m.last_used, m.last_type, m.last_pos, m.finished_at, 1 AS src
+                    FROM sprint_book_meta m
+                    WHERE m.guild_id=%s AND m.user_id=%s
+                    UNION ALL
+                    SELECT sp.title, NULL::text, sp.sprint_end_time, sp.type, NULL::double precision,
+                           NULL::timestamp, 0
+                    FROM sprint_participants sp
+                    JOIN sprints s ON s.id = sp.sprint_id
+                    WHERE s.guild_id=%s AND sp.user_id=%s AND sp.title IS NOT NULL AND sp.title NOT LIKE '%% & %%'
+                ) u
+                ORDER BY LOWER(title), src DESC, last_used DESC NULLS LAST
+            ) d
+            ORDER BY last_used DESC NULLS LAST
+        """, guild_id, user_id, guild_id, user_id)
 
     async def get_sprint_leaderboard(self, guild_id: int, limit: int = 10) -> list:
         return await self._fetchall("""

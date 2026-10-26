@@ -1981,6 +1981,16 @@ class Sprints(commands.Cog):
         view = SprintLogSelectView(self.bot, logs, interaction.guild.id)
         await interaction.response.send_message("Select a sprint log to edit or delete:", view=view, ephemeral=True)
 
+    @race.command(name="books", description="See all your books and mark them completed or DNF.")
+    async def sprint_books(self, interaction: discord.Interaction):
+        books = await self.bot.db.get_user_books(interaction.guild.id, interaction.user.id)
+        if not books:
+            await interaction.response.send_message(
+                "📚 No books yet — join a sprint with a book and it'll show up here.", ephemeral=True)
+            return
+        view = BooksView(self, interaction.user.id, interaction.guild.id, books)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
     # ── /race stats ───────────────────────────────────────────────────────────
 
     @race.command(name="stats", description="View sprint stats for yourself or another member")
@@ -2002,6 +2012,15 @@ class Sprints(commands.Cog):
             embed.add_field(name="GG Earned from Sprints", value=f"{gg_earned} GG")
         if unlogged:
             embed.add_field(name=f"{_emoji(self.bot, 'griffinlurk')} Unlogged Sprints", value=str(unlogged))
+        books = await self.bot.db.get_user_books(interaction.guild.id, member.id)
+        if books:
+            order = {"completed": 0, "dnf": 1, None: 2}
+            books.sort(key=lambda b: (order[b["status"]], -(b["finished_at"] or b["last_used"] or datetime(1970, 1, 1)).timestamp()))
+            counts = {k: sum(1 for b in books if b["status"] == k) for k in order}
+            header = (f"{_emoji(self.bot, 'books')} Books — {counts['completed']} COM · {counts['dnf']} DNF · "
+                      f"{counts[None]} CR")
+            lines = [f"`{_STATUS_TAG[b['status']]}` {b['title']}" for b in books]
+            _add_chunked_field(embed, header, lines, "", limit=1000, budget=1800)
         await interaction.followup.send(embed=embed)
 
     # ── /race leaderboard ────────────────────────────────────────────────────
@@ -2266,6 +2285,158 @@ class SprintDeleteConfirmView(SafeView):
             item.disabled = True
         await interaction.response.edit_message(content="Cancelled.", view=self)
         self.stop()
+
+
+_STATUS_TAG = {"completed": "COM", "dnf": "DNF", None: "CR"}
+
+
+def _book_position(book: dict) -> str:
+    pos = book.get("last_pos")
+    if pos is None:
+        return ""
+    if str(book.get("last_type") or "").startswith("audio"):
+        return f"{pos:.1f}%".replace(".0%", "%")
+    return f"page {int(round(pos))}"
+
+
+class BooksView(SafeView):
+    """/race books — everything you've sprinted with, whether or not it's on your recent list. Pick a book and
+    mark it completed or DNF (or put it back to reading). This never touches a sprint's page totals."""
+
+    PAGE = 25                                   # Discord's dropdown limit
+
+    def __init__(self, cog, owner_id: int, guild_id: int, books: list, tab: str = "reading"):
+        super().__init__(timeout=300)
+        self.cog, self.owner_id, self.guild_id = cog, owner_id, guild_id
+        self.tab, self.page, self.selected, self.note = tab, 0, None, None
+        self.books = books
+        self._build()
+
+    # -- data -----------------------------------------------------------------------------------------
+    def _shown(self) -> list:
+        if self.tab == "reading":
+            return [b for b in self.books if b["status"] is None]
+        done = [b for b in self.books if b["status"] is not None]
+        return sorted(done, key=lambda b: b["finished_at"] or b["last_used"] or datetime(1970, 1, 1), reverse=True)
+
+    def _page_items(self) -> list:
+        shown = self._shown()
+        pages = max(1, -(-len(shown) // self.PAGE))
+        self.page = min(self.page, pages - 1)
+        return shown[self.page * self.PAGE:(self.page + 1) * self.PAGE]
+
+    def embed(self) -> discord.Embed:
+        reading = sum(1 for b in self.books if b["status"] is None)
+        com = sum(1 for b in self.books if b["status"] == "completed")
+        dnf = sum(1 for b in self.books if b["status"] == "dnf")
+        items = self._page_items()
+        shown = self._shown()
+        pages = max(1, -(-len(shown) // self.PAGE))
+        stack = _emoji(self.cog.bot, "books")
+        if self.tab == "reading":
+            lines = [f"**{b['title']}**" + (f" — {_book_position(b)}" if _book_position(b) else "") for b in items]
+            empty = "Nothing here — every book you've sprinted with is finished. Join a sprint with a new one!"
+            heading = "Currently reading"
+        else:
+            lines = [f"`{_STATUS_TAG[b['status']]}` {b['title']}" for b in items]
+            empty = "No finished books yet."
+            heading = "Finished"
+        body = "\n".join(lines) or empty
+        embed = discord.Embed(
+            title=f"{stack} Your books",
+            description=f"**{reading}** reading · **{com}** completed · **{dnf}** DNF\n\n__{heading}__\n{body}",
+            color=RACE_COLOR,
+        )
+        footer = []
+        if pages > 1:
+            footer.append(f"Page {self.page + 1}/{pages}")
+        footer.append("Pick a book below, then choose what to mark it." if shown else
+                      "Books you sprint with show up here automatically.")
+        embed.set_footer(text=" · ".join(footer))
+        if self.note:
+            embed.description += f"\n\n{self.note}"
+        return embed
+
+    # -- components -----------------------------------------------------------------------------------
+    def _build(self):
+        self.clear_items()
+        items = self._page_items()
+        if items:
+            options = [
+                discord.SelectOption(label=b["title"][:100], value=str(i),
+                                     description=(_book_position(b) or _STATUS_TAG[b["status"]])[:100],
+                                     default=(self.selected == i))
+                for i, b in enumerate(items)
+            ]
+            select = discord.ui.Select(placeholder="Pick a book", options=options, row=0)
+            select.callback = self._on_pick
+            self.add_item(select)
+        for label, tab in (("Reading", "reading"), ("Finished", "done")):
+            btn = discord.ui.Button(label=label, row=1, disabled=(self.tab == tab),
+                                    style=discord.ButtonStyle.primary if self.tab == tab else discord.ButtonStyle.secondary)
+            btn.callback = self._tab_cb(tab)
+            self.add_item(btn)
+        pages = max(1, -(-len(self._shown()) // self.PAGE))
+        if pages > 1:
+            for label, step in (("◀", -1), ("▶", 1)):
+                btn = discord.ui.Button(label=label, row=1, style=discord.ButtonStyle.secondary,
+                                        disabled=not (0 <= self.page + step < pages))
+                btn.callback = self._page_cb(step)
+                self.add_item(btn)
+        have = self.selected is not None and self.selected < len(items)
+        if self.tab == "reading":
+            specs = (("Completed", discord.ButtonStyle.success, "completed"), ("DNF", discord.ButtonStyle.danger, "dnf"))
+        else:
+            specs = (("Back to reading", discord.ButtonStyle.success, None),)
+        for label, style, status in specs:
+            btn = discord.ui.Button(label=label, row=2, style=style, disabled=not have)
+            btn.callback = self._mark_cb(status)
+            self.add_item(btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("These are someone else's books — run `/race books` for yours.",
+                                                    ephemeral=True)
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        self._build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        self.selected = int(interaction.data["values"][0])
+        self.note = None
+        await self._refresh(interaction)
+
+    def _tab_cb(self, tab: str):
+        async def cb(interaction: discord.Interaction):
+            self.tab, self.page, self.selected, self.note = tab, 0, None, None
+            await self._refresh(interaction)
+        return cb
+
+    def _page_cb(self, step: int):
+        async def cb(interaction: discord.Interaction):
+            self.page, self.selected, self.note = self.page + step, None, None
+            await self._refresh(interaction)
+        return cb
+
+    def _mark_cb(self, status):
+        async def cb(interaction: discord.Interaction):
+            items = self._page_items()
+            if self.selected is None or self.selected >= len(items):
+                await interaction.response.send_message("Pick a book first.", ephemeral=True)
+                return
+            title = items[self.selected]["title"]
+            db = self.cog.bot.db
+            await db.set_book_status(self.owner_id, self.guild_id, title, status)
+            self.books = await db.get_user_books(self.guild_id, self.owner_id)
+            self.selected = None
+            self.note = {"completed": f"✅ **{title}** marked as completed.",
+                         "dnf": f"🚫 **{title}** marked as DNF.",
+                         None: f"📖 **{title}** is back on your reading list."}[status]
+            await self._refresh(interaction)
+        return cb
 
 
 class SprintLogSelectView(SafeView):

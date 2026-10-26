@@ -886,6 +886,7 @@ async def help_command(interaction: discord.Interaction):
             "**/race stats** `[member]` — View sprint stats for yourself or another member",
             "**/race leaderboard** — View the sprint leaderboard",
             "**/race edit** — Edit or delete one of your sprint logs",
+            "**/race books** — See all your books and mark them completed or DNF",
         ])
     )
     await interaction.response.send_message(embed=embed)
