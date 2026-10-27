@@ -138,6 +138,21 @@ def _aware(dt):
     return dt
 
 
+async def _resume_if_left(cog, interaction: discord.Interaction, data: dict) -> None:
+    """Doing anything in a sprint means you're in it. If they had pressed Leave, put them back (clock running,
+    back on the card, back on the end ping) rather than leave someone active but 'paused', which showed up as
+    0 minutes and no end ping."""
+    if not data.get("left"):
+        return
+    guild_id, uid = interaction.guild.id, interaction.user.id
+    await interaction.client.db.resume_sprint_participant(guild_id, uid)
+    data["resumed_at"] = datetime.utcnow()
+    data["left"] = False
+    await interaction.channel.send(
+        f"{_emoji(interaction.client, 'griffinreading')} {_nm(interaction.user)} has resumed the sprint!")
+    await cog._update_join_embed(interaction.guild)
+
+
 def _in_sprint_channel(interaction: discord.Interaction, sprint_channel_id: int) -> bool:
     """True if this is the configured channel, a thread/forum post inside it, or the configured thread itself
     (forum posts are threads, so setting a forum allows every post in it)."""
@@ -573,6 +588,7 @@ class JoinSprintModal(SafeModal):
             if not data:
                 await interaction.response.send_message("You're not in this sprint.", ephemeral=True)
                 return
+            await _resume_if_left(self.cog, interaction, data)
             pending = data.get("pending_segment")
             if not pending:
                 await interaction.response.send_message(
@@ -644,6 +660,7 @@ class UpdatePagesModal(SafeModal, title="Update Progress — Pages"):
             await interaction.response.send_message("You haven't joined this sprint yet!", ephemeral=True)
             return
         data = sprint["participants"][uid]
+        await _resume_if_left(self.cog, interaction, data)
         if data["type"] != "pages":
             await interaction.response.send_message("You joined with audio — use the same update button.", ephemeral=True)
             return
@@ -678,6 +695,7 @@ class UpdateAudioPctModal(SafeModal, title="Update Progress — Audio %"):
             await interaction.response.send_message("You haven't joined this sprint yet!", ephemeral=True)
             return
         data = sprint["participants"][uid]
+        await _resume_if_left(self.cog, interaction, data)
         if data["type"] != "audio_pct":
             await interaction.response.send_message("You joined with pages — use the same update button.", ephemeral=True)
             return
@@ -793,6 +811,7 @@ class SwitchBookOldModal(SafeModal):
             await interaction.response.send_message("You're not in this sprint.", ephemeral=True)
             return
         data = sprint["participants"][uid]
+        await _resume_if_left(self.cog, interaction, data)
         try:
             end_val = int(self.value_input.value) if self.ptype == "pages" else float(self.value_input.value.replace("%", ""))
         except ValueError:
@@ -2160,6 +2179,8 @@ class Sprints(commands.Cog):
                 e = end_time.replace(tzinfo=_tz.utc) if end_time.tzinfo is None else end_time
                 total_seconds += max(0, (e - r).total_seconds())
             mins = max(0, int(total_seconds / 60))
+            if mins == 0:
+                return ""                  # under a minute: say nothing rather than a misleading "(0m)"
             return f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
 
         results = []
