@@ -2067,8 +2067,9 @@ class Sprints(commands.Cog):
                 f"Total Pages Logged: {total_pages:,}{gg_part}"
             )
         embeds = _paginate_lines(lines, f"{_emoji(self.bot, 'raceleaderboard')} Sprint Leaderboard")
-        view = EmbedPaginatorView(embeds) if len(embeds) > 1 else None
-        await interaction.followup.send(embed=embeds[0], view=view)
+        # followup.send raises on view=None (unlike channel.send), so only pass a view when there is one
+        kwargs = {"view": EmbedPaginatorView(embeds)} if len(embeds) > 1 else {}
+        await interaction.followup.send(embed=embeds[0], **kwargs)
 
     # ── Internal: finish sprint ──────────────────────────────────────────────
 

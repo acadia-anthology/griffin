@@ -311,14 +311,15 @@ class PatronGroup(app_commands.Group):
             display_name, avatar_bytes, level, placement,
             stats["gg"], gg_into_level, gg_needed, background_bytes, accent_color, tier_name=tier_name
         )
-        view = None
+        kwargs = {}                 # followup.send raises on view=None, so only pass a view when there is one
         if TIP_URL:
             view = discord.ui.View()
             view.add_item(discord.ui.Button(
                 label="🧌 Tip Griffins Goblin King",
                 style=discord.ButtonStyle.link, url=TIP_URL
             ))
-        await interaction.followup.send(file=discord.File(buf, filename="rank.png"), view=view)
+            kwargs["view"] = view
+        await interaction.followup.send(file=discord.File(buf, filename="rank.png"), **kwargs)
 
 
 class GriffinModGroup(app_commands.Group):

@@ -1,3 +1,4 @@
+import traceback
 import discord
 from discord.ext import commands
 import asyncio
@@ -33,7 +34,12 @@ class Griffin(commands.Bot):
             msg = "❌ You don't have permission to use this command."
         else:
             msg = "❌ Something went wrong running that command."
-            print(f"App command error in /{interaction.command.qualified_name if interaction.command else '?'}: {error!r}")
+            name = interaction.command.qualified_name if interaction.command else '?'
+            print(f"App command error in /{name}: {error!r}")
+            # The full traceback, using the original exception when discord.py wrapped it (CommandInvokeError),
+            # so a failure like this can be pinned down from the logs instead of guessed at.
+            cause = getattr(error, "original", None) or error
+            traceback.print_exception(type(cause), cause, cause.__traceback__)
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
