@@ -1993,21 +1993,24 @@ class Sprints(commands.Cog):
 
     @race.command(name="edit", description="Edit or delete one of your sprint logs")
     async def sprint_edit(self, interaction: discord.Interaction):
-        logs = await self.bot.db.get_sprint_logs(interaction.guild.id, interaction.user.id, limit=10)
+        logs = await self.bot.db.get_sprint_logs(interaction.guild.id, interaction.user.id, limit=25)
         if not logs:
             await interaction.response.send_message("You don't have any logged sprints yet.", ephemeral=True)
             return
         view = SprintLogSelectView(self.bot, logs, interaction.guild.id)
-        await interaction.response.send_message("Select a sprint log to edit or delete:", view=view, ephemeral=True)
+        await interaction.response.send_message(
+            "Select a sprint log to edit or delete. This lists your 25 most recent **logged** sprints — a book "
+            "you joined but never logged isn't here (see `/race books` for every book).",
+            view=view, ephemeral=True)
 
-    @race.command(name="books", description="See all your books and mark them completed or DNF.")
+    @race.command(name="books", description="See all your books, newest first, and mark them completed or DNF.")
     async def sprint_books(self, interaction: discord.Interaction):
         books = await self.bot.db.get_user_books(interaction.guild.id, interaction.user.id)
         if not books:
             await interaction.response.send_message(
                 "📚 No books yet — join a sprint with a book and it'll show up here.", ephemeral=True)
             return
-        view = BooksView(self, interaction.user.id, interaction.guild.id, books)
+        view = BooksView(self, interaction.user.id, interaction.guild.id, books, tab="all")
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     # ── /race stats ───────────────────────────────────────────────────────────
@@ -2033,9 +2036,8 @@ class Sprints(commands.Cog):
             embed.add_field(name=f"{_emoji(self.bot, 'griffinlurk')} Unlogged Sprints", value=str(unlogged))
         books = await self.bot.db.get_user_books(interaction.guild.id, member.id)
         if books:
-            order = {"completed": 0, "dnf": 1, None: 2}
-            books.sort(key=lambda b: (order[b["status"]], -(b["finished_at"] or b["last_used"] or datetime(1970, 1, 1)).timestamp()))
-            counts = {k: sum(1 for b in books if b["status"] == k) for k in order}
+            books.sort(key=lambda b: b["last_used"] or datetime(1970, 1, 1), reverse=True)     # last sprinted first
+            counts = {k: sum(1 for b in books if b["status"] == k) for k in ("completed", "dnf", None)}
             header = (f"{_emoji(self.bot, 'books')} Books — {counts['completed']} COM · {counts['dnf']} DNF · "
                       f"{counts[None]} CR")
             lines = [f"`{_STATUS_TAG[b['status']]}` {b['title']}" for b in books]
@@ -2225,7 +2227,7 @@ class Sprints(commands.Cog):
             view = EmbedPaginatorView(embeds) if len(embeds) > 1 else None
             await channel.send(content=librarian_mention or None, embed=embeds[0], view=view)
         else:
-            await channel.send(f"{librarian_mention}No one logged their results. 📭")
+            await channel.send(f"{librarian_mention}No one logged their results. {_emoji(self.bot, 'emptymailbox')}")
 
         sprint_id = await self.bot.db.create_sprint(
             guild_id, sprint["channel"], sprint["host"], sprint["started_at"], sprint_end_time, sprint["duration"],
@@ -2336,6 +2338,9 @@ class BooksView(SafeView):
 
     # -- data -----------------------------------------------------------------------------------------
     def _shown(self) -> list:
+        epoch = datetime(1970, 1, 1)
+        if self.tab == "all":                   # everything, last sprinted with first
+            return sorted(self.books, key=lambda b: b["last_used"] or epoch, reverse=True)
         if self.tab == "reading":
             return [b for b in self.books if b["status"] is None]
         done = [b for b in self.books if b["status"] is not None]
@@ -2355,7 +2360,12 @@ class BooksView(SafeView):
         shown = self._shown()
         pages = max(1, -(-len(shown) // self.PAGE))
         stack = _emoji(self.cog.bot, "books")
-        if self.tab == "reading":
+        if self.tab == "all":
+            lines = [f"`{_STATUS_TAG[b['status']]}` **{b['title']}**"
+                     + (f" — {_book_position(b)}" if b["status"] is None and _book_position(b) else "") for b in items]
+            empty = "No books yet."
+            heading = "All your books · last sprinted first"
+        elif self.tab == "reading":
             lines = [f"**{b['title']}**" + (f" — {_book_position(b)}" if _book_position(b) else "") for b in items]
             empty = "Nothing here — every book you've sprinted with is finished. Join a sprint with a new one!"
             heading = "Currently reading"
@@ -2386,14 +2396,15 @@ class BooksView(SafeView):
         if items:
             options = [
                 discord.SelectOption(label=b["title"][:100], value=str(i),
-                                     description=(_book_position(b) or _STATUS_TAG[b["status"]])[:100],
+                                     description=((_book_position(b) if b["status"] is None else "")
+                                                  or _STATUS_TAG[b["status"]])[:100],
                                      default=(self.selected == i))
                 for i, b in enumerate(items)
             ]
             select = discord.ui.Select(placeholder="Pick a book", options=options, row=0)
             select.callback = self._on_pick
             self.add_item(select)
-        for label, tab in (("Reading", "reading"), ("Finished", "done")):
+        for label, tab in (("All", "all"), ("Reading", "reading"), ("Finished", "done")):
             btn = discord.ui.Button(label=label, row=1, disabled=(self.tab == tab),
                                     style=discord.ButtonStyle.primary if self.tab == tab else discord.ButtonStyle.secondary)
             btn.callback = self._tab_cb(tab)
@@ -2406,12 +2417,16 @@ class BooksView(SafeView):
                 btn.callback = self._page_cb(step)
                 self.add_item(btn)
         have = self.selected is not None and self.selected < len(items)
+        current = items[self.selected]["status"] if have else "-"
         if self.tab == "reading":
             specs = (("Completed", discord.ButtonStyle.success, "completed"), ("DNF", discord.ButtonStyle.danger, "dnf"))
+        elif self.tab == "all":                 # any book, any status: the one it already has is greyed out
+            specs = (("Completed", discord.ButtonStyle.success, "completed"), ("DNF", discord.ButtonStyle.danger, "dnf"),
+                     ("Back to reading", discord.ButtonStyle.secondary, None))
         else:
             specs = (("Back to reading", discord.ButtonStyle.success, None),)
         for label, style, status in specs:
-            btn = discord.ui.Button(label=label, row=2, style=style, disabled=not have)
+            btn = discord.ui.Button(label=label, row=2, style=style, disabled=(not have or (self.tab == "all" and status == current)))
             btn.callback = self._mark_cb(status)
             self.add_item(btn)
 
