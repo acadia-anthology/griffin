@@ -2013,6 +2013,48 @@ class Sprints(commands.Cog):
         view = BooksView(self, interaction.user.id, interaction.guild.id, books, tab="all")
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
+    @race.command(name="reset-stats", description="Staff: clear sprint stats for everyone, or for specific people.")
+    @app_commands.describe(
+        members="Mention or paste the IDs of the people to reset. Leave blank to reset EVERYONE.",
+        include_books="Also clear their books list (reading / completed / DNF). Default: keep it.",
+    )
+    async def sprint_reset_stats(self, interaction: discord.Interaction, members: str = None,
+                                 include_books: bool = False):
+        settings = await self.bot.db.get_guild_config(interaction.guild.id)
+        if not _is_sprint_manager(interaction, settings):         # never open-to-all, even before roles are set up
+            await interaction.response.send_message(
+                "❌ Only sprint managers and staff can reset sprint stats.", ephemeral=True)
+            return
+        user_ids = None
+        if (members or "").strip():
+            user_ids = _parse_user_refs(members)
+            if not user_ids:
+                await interaction.response.send_message(
+                    "❌ I couldn't find anyone in that. @mention them or paste their user IDs (several is fine), "
+                    "or leave it blank to reset everyone.", ephemeral=True)
+                return
+        gid = interaction.guild.id
+        if gid in active_sprints or gid in self._logging_sprints:
+            await interaction.response.send_message(
+                "⏳ A sprint is running (or still collecting logs). Reset stats once it's finished.", ephemeral=True)
+            return
+        preview = await self.bot.db.sprint_reset_preview(gid, user_ids, include_books)
+        if not preview["logs"] and not preview["books"]:
+            await interaction.response.send_message(
+                "Nothing to reset — " + ("there are no sprint logs yet." if user_ids is None
+                                         else "none of those people have any sprint logs."), ephemeral=True)
+            return
+        view = ResetStatsView(self, interaction.user.id, gid, user_ids, include_books, preview)
+        books = f", plus **{preview['books']}** book entries" if include_books else ""
+        await interaction.response.send_message(
+            f"⚠️ **Reset sprint stats for {view._who(interaction.guild)}?**\n"
+            f"This permanently deletes **{preview['logs']}** sprint logs from **{preview['members']}** members "
+            f"(across **{preview['sprints']}** sprints){books}. Their `/race stats` and the leaderboard start over.\n"
+            f"Goblin Gold, levels and scheduled sprints are **not** touched.\n"
+            + ("**Type `RESET` on the next screen to confirm.** " if user_ids is None else "")
+            + "This can't be undone.",
+            view=view, ephemeral=True)
+
     # ── /race stats ───────────────────────────────────────────────────────────
 
     @race.command(name="stats", description="View sprint stats for yourself or another member")
@@ -2474,6 +2516,96 @@ class BooksView(SafeView):
                          None: f"📖 **{title}** is back on your reading list."}[status]
             await self._refresh(interaction)
         return cb
+
+
+_USER_REF = re.compile(r"<@!?(\d{15,25})>|(\d{15,25})")
+
+
+def _parse_user_refs(raw: str) -> list[int]:
+    """Every @mention or pasted user ID in the text, in order, without repeats."""
+    seen, out = set(), []
+    for m in _USER_REF.finditer(raw or ""):
+        uid = int(m.group(1) or m.group(2))
+        if uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+    return out
+
+
+class ResetTypeModal(SafeModal, title="Reset everyone's sprint stats"):
+    confirm = discord.ui.TextInput(label="Type RESET to confirm", placeholder="RESET", max_length=10)
+
+    def __init__(self, view: "ResetStatsView"):
+        super().__init__()
+        self.reset_view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if (self.confirm.value or "").strip().upper() != "RESET":
+            await interaction.response.send_message("❌ That wasn't `RESET`, so nothing was changed.", ephemeral=True)
+            return
+        await self.reset_view.perform(interaction)
+
+
+class ResetStatsView(SafeView):
+    """Confirmation for /race reset-stats. Resetting one or a few people is one click; resetting everyone also
+    needs RESET typed in, because it can't be undone."""
+
+    def __init__(self, cog, owner_id: int, guild_id: int, user_ids, include_books: bool, preview: dict):
+        super().__init__(timeout=120)
+        self.cog, self.owner_id, self.guild_id = cog, owner_id, guild_id
+        self.user_ids, self.include_books, self.preview = user_ids, include_books, preview
+        self.everyone = user_ids is None
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This reset was started by someone else.", ephemeral=True)
+            return False
+        if self.done:
+            await interaction.response.send_message("That reset has already been done.", ephemeral=True)
+            return False
+        return True
+
+    def _who(self, guild) -> str:
+        if self.everyone:
+            return "**everyone**"
+        names = [_uname(guild, uid) for uid in self.user_ids[:10]]
+        more = f" and {len(self.user_ids) - 10} more" if len(self.user_ids) > 10 else ""
+        return ", ".join(f"**{n}**" for n in names) + more
+
+    @discord.ui.button(label="Yes, reset", style=discord.ButtonStyle.danger)
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.everyone:
+            await interaction.response.send_modal(ResetTypeModal(self))
+        else:
+            await self.perform(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        await interaction.response.edit_message(content="Cancelled — nothing was changed.", view=None)
+        self.stop()
+
+    async def perform(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if self.guild_id in active_sprints or self.guild_id in self.cog._logging_sprints:
+            await interaction.response.send_message(
+                "⏳ A sprint just started or is still collecting logs, so I didn't reset anything. Try again "
+                "when it's over.", ephemeral=True)
+            return
+        self.done = True
+        res = await self.cog.bot.db.reset_sprint_stats(self.guild_id, self.user_ids, self.include_books)
+        print(f"reset-stats in guild {self.guild_id} by {interaction.user.id}: "
+              f"{'everyone' if self.everyone else self.user_ids} -> {res}")
+        extra = f" and **{res['books']}** book entries" if self.include_books else ""
+        text = (f"🧹 {_nm(interaction.user)} reset sprint stats for {self._who(guild)}: removed **{res['logs']}** "
+                f"sprint logs from **{res['members']}** members{extra}.")
+        if interaction.type == discord.InteractionType.modal_submit:
+            await interaction.response.send_message(text, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await interaction.response.edit_message(content="✅ Done.", view=None)
+            await interaction.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        self.stop()
 
 
 class SprintLogSelectView(SafeView):

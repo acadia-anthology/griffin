@@ -542,6 +542,57 @@ class Database:
             sprint_id, user_id
         )
 
+    async def sprint_reset_preview(self, guild_id: int, user_ids=None, include_books: bool = False) -> dict:
+        """What a stats reset would delete (nothing is changed). user_ids None = everyone in the server."""
+        everyone, ids = user_ids is None, list(user_ids or [])
+        row = await self._fetchone("""
+            SELECT COUNT(*) AS logs, COUNT(DISTINCT sp.user_id) AS members, COUNT(DISTINCT sp.sprint_id) AS sprints
+            FROM sprint_participants sp JOIN sprints s ON s.id = sp.sprint_id
+            WHERE s.guild_id=%s AND (%s OR sp.user_id = ANY(%s))
+        """, guild_id, everyone, ids)
+        who = await self._fetchall("""
+            SELECT DISTINCT sp.user_id FROM sprint_participants sp JOIN sprints s ON s.id = sp.sprint_id
+            WHERE s.guild_id=%s AND (%s OR sp.user_id = ANY(%s)) ORDER BY sp.user_id
+        """, guild_id, everyone, ids)
+        books = 0
+        if include_books:
+            b = await self._fetchone(
+                "SELECT COUNT(*) AS n FROM sprint_book_meta WHERE guild_id=%s AND (%s OR user_id = ANY(%s))",
+                guild_id, everyone, ids)
+            books = b["n"]
+        return {"logs": row["logs"], "members": row["members"], "sprints": row["sprints"],
+                "books": books, "user_ids": [r[0] if not isinstance(r, dict) else r["user_id"] for r in who]}
+
+    async def reset_sprint_stats(self, guild_id: int, user_ids=None, include_books: bool = False) -> dict:
+        """Deletes sprint history (the logs behind /race stats and the leaderboard) for the given people, or for
+        everyone when user_ids is None. Sprints left with no logs are removed too. One statement, so it either
+        all happens or none of it does. Goblin Gold, level and scheduled sprints are never touched."""
+        everyone, ids = user_ids is None, list(user_ids or [])
+        row = await self._fetchone("""
+            WITH gone AS (
+                DELETE FROM sprint_participants sp USING sprints s
+                WHERE sp.sprint_id = s.id AND s.guild_id=%s AND (%s OR sp.user_id = ANY(%s))
+                RETURNING sp.sprint_id, sp.user_id
+            ), emptied AS (
+                DELETE FROM sprints s
+                WHERE s.guild_id=%s AND s.id IN (SELECT sprint_id FROM gone)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sprint_participants p
+                      WHERE p.sprint_id = s.id
+                        AND NOT EXISTS (SELECT 1 FROM gone g WHERE g.sprint_id = p.sprint_id AND g.user_id = p.user_id))
+                RETURNING s.id
+            ), books AS (
+                DELETE FROM sprint_book_meta
+                WHERE %s AND guild_id=%s AND (%s OR user_id = ANY(%s))
+                RETURNING 1
+            )
+            SELECT (SELECT COUNT(*) FROM gone) AS logs,
+                   (SELECT COUNT(DISTINCT user_id) FROM gone) AS members,
+                   (SELECT COUNT(*) FROM emptied) AS sprints,
+                   (SELECT COUNT(*) FROM books) AS books
+        """, guild_id, everyone, ids, guild_id, include_books, guild_id, everyone, ids)
+        return dict(row)
+
     async def get_sprint_stats(self, guild_id: int, user_id: int) -> dict:
         return await self._fetchone("""
             SELECT COUNT(*) FILTER (WHERE sp.end_count IS NOT NULL) AS sprints_completed,
