@@ -748,7 +748,7 @@ class RaceConfigGroup(GriffinModGroup):
         super().__init__(name="race", description="Configure sprint/race settings")
         self.db = db
 
-    @app_commands.command(name="ping-role", description="Set the role pinged when a sprint/race starts.")
+    @app_commands.command(name="ping-role", description="Set the role pinged when a sprint/race starts (doesn't limit who can race).")
     @app_commands.describe(role="Role to ping for sprints (e.g. Page Racers)")
     async def ping_role(self, interaction: discord.Interaction, role: discord.Role):
         await self.db.set_sprint_role(interaction.guild.id, role.id)
@@ -756,14 +756,14 @@ class RaceConfigGroup(GriffinModGroup):
 
     @app_commands.command(
         name="librarian-role",
-        description="Set who can manage sprints (and who is pinged with results, if you turn that on)."
+        description="Set who can cancel/schedule sprints (and is pinged with results, if on). Anyone can start one."
     )
-    @app_commands.describe(role="Role that can create/manage sprints")
+    @app_commands.describe(role="Role that can cancel/schedule sprints and run the Mod Test")
     async def librarian_role(self, interaction: discord.Interaction, role: discord.Role):
         await self.db.set_sprint_manager_role(interaction.guild.id, role.id)
         await interaction.response.send_message(
-            f"✅ {role.mention} can now manage sprints. It is only pinged with results while "
-            f"`/staff race librarian-ping` is on."
+            f"✅ {role.mention} can now cancel and schedule sprints and run the Mod Test. Anyone can start a normal "
+            f"sprint. The role is only pinged with results while `/staff race librarian-ping` is on."
         )
 
     @app_commands.command(
@@ -883,7 +883,7 @@ async def help_command(interaction: discord.Interaction):
             "**/patron library-card view** `[member]` — Show a patron's library card",
             "**/patron library-card update** — Browse/choose your library card design "
             "and edit its bio, genres, and checked-out books",
-            "**/race start** `<duration_minutes> [countdown_seconds]` — Start a reading/writing sprint",
+            "**/race start** `<duration_minutes> [countdown_seconds]` — Start a reading/writing sprint (anyone can)",
             "**/race stats** `[member]` — View sprint stats for yourself or another member",
             "**/race leaderboard** — View the sprint leaderboard",
             "**/race edit** — Edit or delete one of your sprint logs",
@@ -960,8 +960,10 @@ class StaffGroup(GriffinModGroup):
                 "`members` blank) or for specific people. Sprint managers can use it too. Can't be undone",
                 "**/race cancel** — Force-cancel the sprint that's running or collecting logs",
                 "**/race start** `Mod Test (5 min, no GG)` — A 5-minute practice sprint for testing (also offered in `/race schedule`); never awards GG",
-                "**/staff race ping-role** `<role>` — Set the role pinged when a sprint starts",
-                "**/staff race librarian-role** `<role>` — Set who can manage sprints",
+                "**/staff race ping-role** `<role>` — Set the role pinged when a sprint starts (only controls the ping, "
+                "not who can race)",
+                "**/staff race librarian-role** `<role>` — Set who can cancel and schedule sprints and run the Mod Test "
+                "(anyone can start and join a normal sprint)",
                 "**/staff race librarian-ping** `<on/off>` — Ping the librarian role with sprint results "
                 "(off by default; turn on for readathons)",
                 "**/staff race timezone** `<timezone>` — Server fallback timezone (offered to people who haven't set their own)",

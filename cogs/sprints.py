@@ -191,8 +191,8 @@ def _message_url(guild_id: int, channel_id: int, message_id: int) -> str:
 
 
 def _can_manage_sprints(interaction: discord.Interaction, settings: dict) -> bool:
-    """Race librarian-role, griffin-wide manager-role, or Manage Server. If neither role has been
-    configured yet, sprint management is open (that's the pre-existing behaviour)."""
+    """For cancel/schedule/unschedule (starting a normal sprint is open to everyone): race librarian-role,
+    griffin-wide manager-role, or Manage Server. If neither role has been configured yet, it's open."""
     race_role = settings.get("sprint_manager_role_id")
     griffin_role = settings.get("griffin_manager_role_id")
     if not (race_role or griffin_role):
@@ -1527,12 +1527,7 @@ class Sprints(commands.Cog):
             )
             return
 
-        if not _can_manage_sprints(interaction, settings):
-            await interaction.response.send_message(
-                "❌ You don't have permission to start sprints.", ephemeral=True
-            )
-            return
-
+        # anyone who can use /race can start a sprint; cancel/schedule/unschedule and the Mod Test stay staff-only
         if duration_minutes == TEST_SPRINT_MINUTES and not _is_sprint_manager(interaction, settings):
             await interaction.response.send_message(
                 "❌ Mod Test sprints are for sprint managers only.", ephemeral=True
