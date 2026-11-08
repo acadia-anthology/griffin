@@ -482,14 +482,14 @@ class JoinSprintModal(SafeModal):
     a recent book (or a new one), where you're starting, and — for audiobooks — the book's total pages
     (remembered per book, so it's only asked once)."""
 
-    def __init__(self, cog, recent_titles: list[str], *, switch: bool = False, default_type: str = "pages"):
+    def __init__(self, cog, recent_titles: list[str], *, switch: bool = False):
         super().__init__(title="Switch Books — Next Book" if switch else "Join Sprint")
         self.cog = cog
         self.switch = switch
         self.recent = list(recent_titles)[:3]
-        self.type_select = discord.ui.Select(options=[
-            discord.SelectOption(label="Pages", value="pages", emoji="📖", default=default_type != "audio_pct"),
-            discord.SelectOption(label="Audio %", value="audio_pct", emoji="🎧", default=default_type == "audio_pct"),
+        self.type_select = discord.ui.Select(placeholder="Choose Pages or Audio %", options=[   # nothing preselected
+            discord.SelectOption(label="Pages", value="pages", emoji="📖"),
+            discord.SelectOption(label="Audio %", value="audio_pct", emoji="🎧"),
         ])
         self.add_item(discord.ui.Label(text="Tracking by", component=self.type_select))
         self.book_select = None
@@ -517,7 +517,10 @@ class JoinSprintModal(SafeModal):
     async def on_submit(self, interaction: discord.Interaction):
         db = interaction.client.db
         guild_id, uid = interaction.guild.id, interaction.user.id
-        ptype = (self.type_select.values or ["pages"])[0]
+        if not self.type_select.values:
+            await self._fail(interaction, "Choose **Pages** or **Audio %** under **Tracking by** first.")
+            return
+        ptype = self.type_select.values[0]
         chosen = self.recent[int(self.book_select.values[0])] if self.book_select and self.book_select.values else None
         typed = (self.new_title.value or "").strip()
         if chosen and typed:
@@ -832,16 +835,15 @@ class SwitchBookOldModal(SafeModal):
             f"{_progress_message(interaction.client, interaction.user, gained)}\n"
             f"{_emoji(interaction.client, 'books')} **{old_title}** gets saved at +{gained} pages once you enter your next book — "
             f"hit the button below.",
-            view=SwitchBookContinueView(self.cog, self.ptype, uid),
+            view=SwitchBookContinueView(self.cog, uid),
             ephemeral=False
         )
 
 
 class SwitchBookContinueView(SafeView):
-    def __init__(self, cog, ptype: str, owner_id: int):
+    def __init__(self, cog, owner_id: int):
         super().__init__(timeout=300)
         self.cog = cog
-        self.ptype = ptype
         self.owner_id = owner_id
         _icon(cog.bot, self.continue_btn, "books")
 
@@ -855,7 +857,7 @@ class SwitchBookContinueView(SafeView):
 
     @discord.ui.button(label="📚 Enter New Book", style=discord.ButtonStyle.success)
     async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog._open_join_modal(interaction, switch=True, default_type=self.ptype)
+        await self.cog._open_join_modal(interaction, switch=True)
         for item in self.children:
             item.disabled = True
         try:
@@ -1689,14 +1691,10 @@ class Sprints(commands.Cog):
                 print(f"_refresh_scheduled_messages failed for scheduled sprint {row['id']}:")
                 traceback.print_exc()
 
-    async def _open_join_modal(self, interaction: discord.Interaction, *, switch: bool = False,
-                               default_type: str = "pages"):
+    async def _open_join_modal(self, interaction: discord.Interaction, *, switch: bool = False):
         """Opens the one-step join form straight from a button, with the person's last 3 books to pick from."""
         rows = await self.bot.db.get_recent_sprint_titles(interaction.guild.id, interaction.user.id, limit=3)
-        if rows and not switch:         # start on however they tracked their latest book (pages or audio %)
-            default_type = "audio_pct" if str(rows[0].get("last_type") or "").startswith("audio") else "pages"
-        await interaction.response.send_modal(JoinSprintModal(
-            self, [r["title"] for r in rows], switch=switch, default_type=default_type))
+        await interaction.response.send_modal(JoinSprintModal(self, [r["title"] for r in rows], switch=switch))
 
     async def _find_schedule_conflict(self, guild_id: int, start_utc, duration: int):
         """Another scheduled/active sprint whose window — joining time before it through log time after
