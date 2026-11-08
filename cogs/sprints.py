@@ -506,8 +506,10 @@ class JoinSprintModal(SafeModal):
         self.add_item(discord.ui.Label(text="New book name" if self.recent else "Book name", component=self.new_title))
         self.start_input = discord.ui.TextInput(required=False, max_length=10, placeholder="e.g. 42, or 24 for 24%")
         self.add_item(discord.ui.Label(text="Start page or % (blank = where you left off)", component=self.start_input))
-        self.total_pages = discord.ui.TextInput(required=False, max_length=6, placeholder="Audiobooks only, e.g. 352")
-        self.add_item(discord.ui.Label(text="Book's total pages (for audio %)", component=self.total_pages))
+        self.total_pages = discord.ui.TextInput(required=False, max_length=6, placeholder="e.g. 352 pages")
+        self.add_item(discord.ui.Label(
+            text="Book's total page count",
+            description="Audio % only: how many pages the whole book has (not your %)", component=self.total_pages))
 
     async def _fail(self, interaction: discord.Interaction, message: str):
         await interaction.response.send_message(f"❌ {message}", ephemeral=True)
