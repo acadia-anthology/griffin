@@ -71,8 +71,16 @@ async def _award_sprint_gg(bot, guild: discord.Guild, user_id: int, amount: int)
 _ZWSP = "​"
 
 
+_FIELD_BUDGET = 4500
+
+
+def _lines_overflow(lines: list[str], budget: int = _FIELD_BUDGET) -> bool:
+    """True when `_add_chunked_field` would have to cut this list short (the embed can't hold it all)."""
+    return sum(len(line) + 1 for line in lines) > budget
+
+
 def _add_chunked_field(embed: discord.Embed, header: str, lines: list[str], empty_text: str,
-                       limit: int = 1000, budget: int = 4500) -> None:
+                       limit: int = 1000, budget: int = _FIELD_BUDGET) -> None:
     """Lists `lines` across as many fields as needed. Discord rejects a field over 1024 chars and an
     embed over 6000, and a rejected send/edit means the message silently never updates — so keep every
     field under `limit`, and if a huge group would blow past `budget` total, truncate with a count."""
@@ -82,7 +90,7 @@ def _add_chunked_field(embed: discord.Embed, header: str, lines: list[str], empt
     used = 0
     for i, line in enumerate(lines):
         if used + len(line) + 1 > budget:
-            lines = lines[:i] + [f"…and {len(lines) - i} more"]
+            lines = lines[:i] + [f"…and {len(lines) - i} more — tap **All Patrons** to see everyone"]
             break
         used += len(line) + 1
     first, chunk = True, ""
@@ -452,7 +460,7 @@ class EmbedPaginatorView(SafeView):
 
 
 def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit: int = 3500,
-                    header: str | None = None) -> list[discord.Embed]:
+                    header: str | None = None, sep: str = "\n\n") -> list[discord.Embed]:
     """One embed holds as many lines as fit under the description cap (4096); only start a new page
     when it's genuinely full. `per_page` is just a sanity ceiling, not a readability cap. `header`
     (e.g. a sprint's title) is repeated at the top of every page."""
@@ -462,11 +470,11 @@ def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit
     current: list[str] = []
     current_len = 0
     for line in lines:
-        if current and (len(current) >= per_page or current_len + len(line) + 2 > char_limit):
+        if current and (len(current) >= per_page or current_len + len(line) + len(sep) > char_limit):
             pages.append(current)
             current, current_len = [], 0
         current.append(line)
-        current_len += len(line) + 2    # +2 for the "\n\n" the lines are joined with
+        current_len += len(line) + len(sep)
     if current:
         pages.append(current)
     if not pages:
@@ -474,7 +482,7 @@ def _paginate_lines(lines: list[str], title: str, per_page: int = 40, char_limit
     return [
         discord.Embed(
             title=title,
-            description=(f"{header}\n\n" if header else "") + ("\n\n".join(p) or "Nothing here yet."),
+            description=(f"{header}\n\n" if header else "") + (sep.join(p) or "Nothing here yet."),
             color=RACE_COLOR,
         )
         for p in pages
@@ -919,10 +927,30 @@ class ResumeOrFreshView(SafeView):
         await self.cog._open_join_modal(interaction)
 
 
+async def _send_all_patrons(cog, interaction: discord.Interaction, *, ending: bool):
+    """Ephemeral, paged list of every patron — for when the sprint message can't hold them all."""
+    guild = interaction.guild
+    if ending:
+        lines = cog._end_patron_lines(guild.id) if guild.id in cog._logging_sprints else []
+        title = f"{_emoji(cog.bot, 'blankbook')} Sprint Patrons"
+    else:
+        sprint = active_sprints.get(guild.id)
+        lines = cog._join_patron_lines(guild, sprint["participants"]) if sprint else []
+        title = f"{_emoji(cog.bot, 'blankbook')} Sprint Patrons"
+    if not lines:
+        await interaction.response.send_message("There's no sprint roster to show right now.", ephemeral=True)
+        return
+    embeds = _paginate_lines(lines, title, per_page=60, sep="\n")
+    kwargs = {"view": EmbedPaginatorView(embeds)} if len(embeds) > 1 else {}
+    await interaction.response.send_message(embed=embeds[0], ephemeral=True, **kwargs)
+
+
 class JoinSprintView(SafeView):
-    def __init__(self, cog):
+    def __init__(self, cog, *, show_patrons: bool = False):
         super().__init__(timeout=None)
         self.cog = cog
+        if not show_patrons:                 # only appears once the roster outgrows the embed
+            self.remove_item(self.patrons_btn)
         _icon(cog.bot, self.join_btn, "joinsprint")
         _icon(cog.bot, self.update_btn, "update")
         _icon(cog.bot, self.switch_btn, "books")
@@ -980,6 +1008,10 @@ class JoinSprintView(SafeView):
             return
         await interaction.response.send_modal(SwitchBookOldModal(self.cog, ptype))
 
+    @discord.ui.button(label="📜 All Patrons", style=discord.ButtonStyle.secondary, custom_id="sprint_patrons_btn", row=2)
+    async def patrons_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _send_all_patrons(self.cog, interaction, ending=False)
+
     @discord.ui.button(label="🚪 Leave Sprint", style=discord.ButtonStyle.danger, custom_id="sprint_leave_btn", row=1)
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id, uid = interaction.guild.id, interaction.user.id
@@ -1000,9 +1032,11 @@ class JoinSprintView(SafeView):
 
 
 class LogProgressView(SafeView):
-    def __init__(self, cog):
+    def __init__(self, cog, *, show_patrons: bool = False):
         super().__init__(timeout=None)
         self.cog = cog
+        if not show_patrons:
+            self.remove_item(self.patrons_btn)
         _icon(cog.bot, self.log_btn, "logpages")
 
     @discord.ui.button(label="📝 Log Sprint", style=discord.ButtonStyle.success, custom_id="sprint_log_btn", row=0)
@@ -1021,6 +1055,10 @@ class LogProgressView(SafeView):
             return
         modal_cls = LogPagesModal if ptype == "pages" else LogAudioPctModal
         await interaction.response.send_modal(modal_cls(self.cog))
+
+    @discord.ui.button(label="📜 All Patrons", style=discord.ButtonStyle.secondary, custom_id="sprint_log_patrons_btn", row=0)
+    async def patrons_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _send_all_patrons(self.cog, interaction, ending=True)
 
 
 # ── Scheduling UI ─────────────────────────────────────────────────────────────
@@ -1267,8 +1305,8 @@ class Sprints(commands.Cog):
                 task.cancel()
 
     async def cog_load(self):
-        self.bot.add_view(JoinSprintView(self))
-        self.bot.add_view(LogProgressView(self))
+        self.bot.add_view(JoinSprintView(self, show_patrons=True))     # registered with every button so each
+        self.bot.add_view(LogProgressView(self, show_patrons=True))    # custom_id still works after a restart
         self._spawn(self._restore_sprints())
         self.scheduler_tick.start()
 
@@ -1381,6 +1419,20 @@ class Sprints(commands.Cog):
 
     _FIELD_LIMIT = 1000
 
+    def _join_patron_lines(self, guild: discord.Guild, participants: dict) -> list[str]:
+        lines = []
+        bookmark = _emoji(self.bot, "bookmark")
+        for uid, data in participants.items():
+            if data.get("left"):
+                continue
+            title = data.get("title") or ""
+            suffix = f" of **{title}**" if title else ""
+            if data["type"] == "audio_pct":
+                lines.append(f"{bookmark} {_uname(guild, uid)} - {data['start']:.1f}%{suffix}")
+            else:
+                lines.append(f"{bookmark} {_uname(guild, uid)} - page {data['start']}{suffix}")
+        return lines
+
     def _build_sprint_embeds(self, guild: discord.Guild, start_time, end_time, host_name, duration,
                              title: str | None = None, description: str | None = None) -> list[discord.Embed]:
         sprint = active_sprints.get(guild.id)
@@ -1414,17 +1466,7 @@ class Sprints(commands.Cog):
             main_embed.add_field(name=header, value="No participants yet", inline=False)
             return [main_embed]
 
-        p_lines = []
-        for uid, data in participants.items():
-            if data.get("left"):
-                continue
-            title = data.get("title") or ""
-            suffix = f" of **{title}**" if title else ""
-            bookmark = _emoji(self.bot, "bookmark")
-            if data["type"] == "audio_pct":
-                p_lines.append(f"{bookmark} {_uname(guild, uid)} - {data['start']:.1f}%{suffix}")
-            else:
-                p_lines.append(f"{bookmark} {_uname(guild, uid)} - page {data['start']}{suffix}")
+        p_lines = self._join_patron_lines(guild, participants)
 
         _add_chunked_field(main_embed, header, p_lines, "No participants yet", limit=self._FIELD_LIMIT)
 
@@ -1449,14 +1491,15 @@ class Sprints(commands.Cog):
                 guild, start_time, end_time, host_name, sprint["duration"],
                 title=sprint.get("title"), description=sprint.get("description")
             )
-            await msg.edit(embeds=embeds)
+            overflow = _lines_overflow(self._join_patron_lines(guild, sprint["participants"]))
+            await msg.edit(embeds=embeds, view=JoinSprintView(self, show_patrons=overflow))
         except Exception:
             print(f"_update_join_embed failed for guild {guild.id}:")
             traceback.print_exc()
 
     # ── End-of-sprint checklist ───────────────────────────────────────────────
 
-    def _build_end_embed(self, guild_id: int, deadline) -> discord.Embed:
+    def _end_patron_lines(self, guild_id: int) -> list[str]:
         sprint = self._logging_sprints.get(guild_id, {})
         participants = sprint.get("participants", {})
         lines = []
@@ -1470,6 +1513,10 @@ class Sprints(commands.Cog):
             else:
                 mark = ""
             lines.append(f"{ink} {_uname(self.bot.get_guild(guild_id), uid)}{mark}")
+        return lines
+
+    def _build_end_embed(self, guild_id: int, deadline) -> discord.Embed:
+        lines = self._end_patron_lines(guild_id)
         embed = discord.Embed(
             description=(
                 f"## {_emoji(self.bot, 'snuffedcandle')} Focus Time Ended!\n\n"
@@ -1501,7 +1548,9 @@ class Sprints(commands.Cog):
             return
         try:
             msg = await channel.fetch_message(message_id)
-            await msg.edit(embed=self._build_end_embed(guild.id, deadline))
+            overflow = _lines_overflow(self._end_patron_lines(guild.id))
+            await msg.edit(embed=self._build_end_embed(guild.id, deadline),
+                           view=LogProgressView(self, show_patrons=overflow))
         except Exception:
             print(f"_update_end_embed failed for guild {guild.id}:")
             traceback.print_exc()
@@ -2150,7 +2199,7 @@ class Sprints(commands.Cog):
             await self.bot.db.delete_active_sprint(guild_id)
             return
 
-        view = LogProgressView(self)
+        view = LogProgressView(self, show_patrons=_lines_overflow(self._end_patron_lines(guild_id)))
         end_embed = self._build_end_embed(guild_id, deadline)
         # Mentions inside an embed render but never notify — the ping has to be message content.
         ping_ids = [uid for uid, d in sprint["participants"].items() if not d.get("left")]
