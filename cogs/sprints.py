@@ -365,12 +365,18 @@ def _leg_pages(data: dict, end_val) -> int:
 
 def _combined_title_and_pages(data: dict, end_val) -> tuple[str | None, int]:
     """Folds in any Switch Books segments to produce one final title + page total."""
-    leg_pages = _leg_pages(data, end_val)
+    leg_pages = _leg_pages(data, end_val) if end_val is not None else 0   # None = switched, 2nd book not logged
     segments = data.get("segments") or []
     total_pages = leg_pages + sum(p for _, p in segments)
-    titles = [t for t, _ in segments if t] + ([data["title"]] if data.get("title") else [])
+    titles = [t for t, _ in segments if t] + ([data["title"]] if data.get("title") and end_val is not None else [])
     title = " & ".join(dict.fromkeys(titles)) if titles else None
     return title, total_pages
+
+
+def _has_progress(data: dict) -> bool:
+    """True once someone has something countable: a logged final page, or at least one finished book
+    saved by Switch Books (even if they never updated the book they switched to)."""
+    return data.get("end") is not None or bool(data.get("segments"))
 
 
 class SafeView(discord.ui.View):
@@ -1457,7 +1463,12 @@ class Sprints(commands.Cog):
         ink = _emoji(self.bot, "inkandquill")
         stamp = _emoji(self.bot, "librarystamp")
         for uid, data in participants.items():
-            mark = f" {stamp}" if data.get("end") is not None else ""
+            if data.get("end") is not None:
+                mark = f" {stamp}"
+            elif data.get("segments"):          # switched books: first book counts, second not updated yet
+                mark = f" {_emoji(self.bot, 'bookswap')}"
+            else:
+                mark = ""
             lines.append(f"{ink} {_uname(self.bot.get_guild(guild_id), uid)}{mark}")
         embed = discord.Embed(
             description=(
@@ -2199,7 +2210,7 @@ class Sprints(commands.Cog):
         gg = await _gg_for_duration(self.bot.db, guild_id, sprint["duration"])
         silent_gg_uids = []
         for uid, data in final_participants.items():
-            if data["end"] is not None and not data.get("gg_awarded"):
+            if _has_progress(data) and not data.get("gg_awarded"):
                 await _award_sprint_gg(self.bot, guild, uid, gg)
                 data["gg_awarded"] = True
                 silent_gg_uids.append(uid)
@@ -2225,7 +2236,7 @@ class Sprints(commands.Cog):
 
         results = []
         for uid, data in final_participants.items():
-            if data["end"] is None:
+            if not _has_progress(data):
                 continue
             member = guild.get_member(uid)
             name = _safe_name(member, uid)
@@ -2271,7 +2282,7 @@ class Sprints(commands.Cog):
             title=sprint.get("title"), is_scheduled=bool(sprint.get("scheduled_id")),
         )
         for uid, data in final_participants.items():
-            if data["end"] is not None:
+            if _has_progress(data):
                 title, total_pages = _combined_title_and_pages(data, data["end"])
                 start_val, end_val = 0, total_pages
             else:
