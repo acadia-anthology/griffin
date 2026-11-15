@@ -227,6 +227,7 @@ class Database:
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS last_pos DOUBLE PRECISION;")
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS status TEXT;")
         await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP;")
+        await self._execute("ALTER TABLE sprint_book_meta ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT FALSE;")
 
     # --- members / GG ---
     # GG is purely cosmetic (rank + bragging rights) — nothing spends it, so
@@ -640,7 +641,7 @@ class Database:
                 ORDER BY LOWER(title), last_used DESC NULLS LAST
             ) d
             WHERE LOWER(title) NOT IN (
-                SELECT LOWER(title) FROM sprint_book_meta WHERE guild_id=%s AND user_id=%s AND finished
+                SELECT LOWER(title) FROM sprint_book_meta WHERE guild_id=%s AND user_id=%s AND (finished OR hidden)
             )
             ORDER BY last_used DESC NULLS LAST
             LIMIT %s
@@ -681,7 +682,7 @@ class Database:
                DO UPDATE SET
                  total_pages = COALESCE(%s, sprint_book_meta.total_pages),
                  last_used = (NOW() AT TIME ZONE 'UTC'),
-                 finished = FALSE, status = NULL, finished_at = NULL""",
+                 finished = FALSE, status = NULL, finished_at = NULL, hidden = FALSE""",
             user_id, guild_id, title, total_pages, total_pages
         )
 
@@ -725,8 +726,54 @@ class Database:
                 ) u
                 ORDER BY LOWER(title), src DESC, last_used DESC NULLS LAST
             ) d
+            WHERE LOWER(title) NOT IN (
+                SELECT LOWER(title) FROM sprint_book_meta WHERE guild_id=%s AND user_id=%s AND hidden
+            )
             ORDER BY last_used DESC NULLS LAST
-        """, guild_id, user_id, guild_id, user_id)
+        """, guild_id, user_id, guild_id, user_id, guild_id, user_id)
+
+    async def hide_book(self, user_id: int, guild_id: int, title: str):
+        """Takes a book off this person's lists (/race books and the join form). Their sprint logs and page
+        totals are left alone; sprinting with the book again brings it back."""
+        title = await self._book_title(user_id, guild_id, title)
+        await self._execute(
+            """INSERT INTO sprint_book_meta (user_id, guild_id, title, hidden)
+               VALUES (%s,%s,%s,TRUE)
+               ON CONFLICT (user_id, guild_id, title) DO UPDATE SET hidden = TRUE""",
+            user_id, guild_id, title)
+
+    async def rename_book(self, user_id: int, guild_id: int, old_title: str, new_title: str) -> bool:
+        """Renames one of this person's books everywhere it's recorded (saved books + their logged sprints).
+        False if they already have a different book with that name. Page totals never change."""
+        new_title = new_title.strip()
+        old_title = await self._book_title(user_id, guild_id, old_title)
+        if new_title.lower() != old_title.lower():
+            for b in await self.get_user_books(guild_id, user_id):
+                if b["title"].lower() == new_title.lower():
+                    return False
+            # a deleted book with that name is out of the way; clear it so the name is free
+            await self._execute(
+                "DELETE FROM sprint_book_meta WHERE user_id=%s AND guild_id=%s AND LOWER(title)=LOWER(%s) AND hidden",
+                user_id, guild_id, new_title)
+        await self._execute(
+            "UPDATE sprint_book_meta SET title=%s WHERE user_id=%s AND guild_id=%s AND LOWER(title)=LOWER(%s)",
+            new_title, user_id, guild_id, old_title)
+        await self._execute(
+            """UPDATE sprint_participants sp SET title=%s FROM sprints s
+               WHERE s.id = sp.sprint_id AND s.guild_id=%s AND sp.user_id=%s AND LOWER(sp.title)=LOWER(%s)""",
+            new_title, guild_id, user_id, old_title)
+        return True
+
+    async def get_unlogged_leaderboard(self, guild_id: int, exclude_minutes: int = 5) -> list:
+        """Everyone who has joined a sprint and never logged it, most unlogged first (Mod Test sprints skipped)."""
+        return await self._fetchall("""
+            SELECT sp.user_id, COUNT(*) AS unlogged
+            FROM sprint_participants sp
+            JOIN sprints s ON s.id = sp.sprint_id
+            WHERE s.guild_id=%s AND sp.end_count IS NULL AND s.duration_minutes <> %s
+            GROUP BY sp.user_id
+            ORDER BY unlogged DESC, sp.user_id
+        """, guild_id, exclude_minutes)
 
     async def get_sprint_leaderboard(self, guild_id: int, limit: int = 10) -> list:
         return await self._fetchall("""

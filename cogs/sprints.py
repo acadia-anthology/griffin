@@ -13,6 +13,7 @@ from cogs.economy import _award_gg
 from utils.emojis import emoji as _emoji, partial as _partial_emoji
 
 LOG_WINDOW_MINUTES = 7
+LEADERBOARD_PER_PAGE = 20        # patrons per page on the leaderboard embeds
 TEST_SPRINT_MINUTES = 5         # "Mod Test": sprint managers only, never awards (or deducts) GG
 SCHEDULED_JOIN_MINUTES = 5   # joining window before a scheduled sprint's focus time
 RACE_COLOR = discord.Color(0x26878D)
@@ -500,7 +501,7 @@ class JoinSprintModal(SafeModal):
         super().__init__(title="Switch Books — Next Book" if switch else "Join Sprint")
         self.cog = cog
         self.switch = switch
-        self.recent = list(recent_titles)[:3]
+        self.recent = list(recent_titles)[:25]          # Discord's dropdown limit
         self.type_select = discord.ui.Select(placeholder="Choose Pages or Audio %", options=[   # nothing preselected
             discord.SelectOption(label="Pages", value="pages", emoji="📖"),
             discord.SelectOption(label="Audio %", value="audio_pct", emoji="🎧"),
@@ -509,10 +510,10 @@ class JoinSprintModal(SafeModal):
         self.book_select = None
         if self.recent:
             self.book_select = discord.ui.Select(
-                min_values=0, required=False, placeholder="Pick one of your recent books",
+                min_values=0, required=False, placeholder="Pick a book you're reading",
                 options=[discord.SelectOption(label=t[:100], value=str(i)) for i, t in enumerate(self.recent)],
             )
-            self.add_item(discord.ui.Label(text="Recent book", component=self.book_select))
+            self.add_item(discord.ui.Label(text="Currently reading", component=self.book_select))
         self.new_title = discord.ui.TextInput(
             required=False, max_length=100,
             placeholder="Only if it isn't in the list above" if self.recent else "What are you reading?",
@@ -538,11 +539,11 @@ class JoinSprintModal(SafeModal):
         chosen = self.recent[int(self.book_select.values[0])] if self.book_select and self.book_select.values else None
         typed = (self.new_title.value or "").strip()
         if chosen and typed:
-            await self._fail(interaction, "Pick one of your recent books **or** type a new one — not both.")
+            await self._fail(interaction, "Pick one of your books **or** type a new one — not both.")
             return
         title = chosen or typed or None
         if ptype == "audio_pct" and not title:
-            await self._fail(interaction, "Pick a recent book or type the audiobook's name.")
+            await self._fail(interaction, "Pick one of your books or type the audiobook's name.")
             return
         meta = await db.get_sprint_book_meta(uid, guild_id, title) if title else None
         raw_start = (self.start_input.value or "").strip()
@@ -1752,8 +1753,9 @@ class Sprints(commands.Cog):
                 traceback.print_exc()
 
     async def _open_join_modal(self, interaction: discord.Interaction, *, switch: bool = False):
-        """Opens the one-step join form straight from a button, with the person's last 3 books to pick from."""
-        rows = await self.bot.db.get_recent_sprint_titles(interaction.guild.id, interaction.user.id, limit=3)
+        """Opens the one-step join form straight from a button, with every book they're currently reading to
+        pick from (newest first, up to the 25 a dropdown can hold; completed and DNF books drop off)."""
+        rows = await self.bot.db.get_recent_sprint_titles(interaction.guild.id, interaction.user.id, limit=25)
         await interaction.response.send_modal(JoinSprintModal(self, [r["title"] for r in rows], switch=switch))
 
     async def _find_schedule_conflict(self, guild_id: int, start_utc, duration: int):
@@ -2058,7 +2060,7 @@ class Sprints(commands.Cog):
             "you joined but never logged isn't here (see `/race books` for every book).",
             view=view, ephemeral=True)
 
-    @race.command(name="books", description="See all your books, newest first, and mark them completed or DNF.")
+    @race.command(name="books", description="See all your books, newest first; mark them completed or DNF, rename or delete them.")
     async def sprint_books(self, interaction: discord.Interaction):
         books = await self.bot.db.get_user_books(interaction.guild.id, interaction.user.id)
         if not books:
@@ -2144,8 +2146,12 @@ class Sprints(commands.Cog):
     # ── /race leaderboard ────────────────────────────────────────────────────
 
     @race.command(name="leaderboard", description="View the sprint leaderboard")
-    async def sprint_leaderboard(self, interaction: discord.Interaction):
+    @app_commands.describe(unlogged_sprints="Show who has the most unlogged sprints instead")
+    async def sprint_leaderboard(self, interaction: discord.Interaction, unlogged_sprints: bool = False):
         await interaction.response.defer()
+        if unlogged_sprints:
+            await self._send_unlogged_leaderboard(interaction)
+            return
         rows = await self.bot.db.get_sprint_leaderboard(interaction.guild.id, limit=1000)
         if not rows:
             await interaction.followup.send("No sprint data yet!")
@@ -2165,8 +2171,27 @@ class Sprints(commands.Cog):
                 f"{sprints} Sprint{'s' if sprints != 1 else ''} | "
                 f"Total Pages Logged: {total_pages:,}{gg_part}"
             )
-        embeds = _paginate_lines(lines, f"{_emoji(self.bot, 'raceleaderboard')} Sprint Leaderboard")
+        embeds = _paginate_lines(lines, f"{_emoji(self.bot, 'raceleaderboard')} Sprint Leaderboard",
+                                 per_page=LEADERBOARD_PER_PAGE)
         # followup.send raises on view=None (unlike channel.send), so only pass a view when there is one
+        kwargs = {"view": EmbedPaginatorView(embeds)} if len(embeds) > 1 else {}
+        await interaction.followup.send(embed=embeds[0], **kwargs)
+
+    async def _send_unlogged_leaderboard(self, interaction: discord.Interaction):
+        """Everyone with at least one sprint they joined and never logged. No unlogged sprints, not listed."""
+        rows = await self.bot.db.get_unlogged_leaderboard(interaction.guild.id, TEST_SPRINT_MINUTES)
+        if not rows:
+            await interaction.followup.send("Nobody has an unlogged sprint — everyone's been logging! 📚")
+            return
+        medals = [_emoji(self.bot, "firstunlogged"), _emoji(self.bot, "secondunlogged"), _emoji(self.bot, "thirdunlogged")]
+        ordinals = ["1ST", "2ND", "3RD"] + [f"{i}TH" for i in range(4, len(rows) + 1)]
+        lines = []
+        for i, row in enumerate(rows):
+            name = _safe_name(interaction.guild.get_member(row["user_id"]), row["user_id"])
+            n = row["unlogged"] or 0
+            lead = f"{medals[i]} " if i < 3 and medals[i] else ""
+            lines.append(f"{lead}**{ordinals[i]} - {name.upper()}**\n{n} Unlogged Sprint{'s' if n != 1 else ''}")
+        embeds = _paginate_lines(lines, "Can't Blame Gerald for This…", per_page=LEADERBOARD_PER_PAGE)
         kwargs = {"view": EmbedPaginatorView(embeds)} if len(embeds) > 1 else {}
         await interaction.followup.send(embed=embeds[0], **kwargs)
 
@@ -2430,6 +2455,7 @@ class BooksView(SafeView):
         super().__init__(timeout=300)
         self.cog, self.owner_id, self.guild_id = cog, owner_id, guild_id
         self.tab, self.page, self.selected, self.note = tab, 0, None, None
+        self.confirming = False                 # waiting on "really delete this book?"
         self.books = books
         self._build()
 
@@ -2526,6 +2552,20 @@ class BooksView(SafeView):
             btn = discord.ui.Button(label=label, row=2, style=style, disabled=(not have or (self.tab == "all" and status == current)))
             btn.callback = self._mark_cb(status)
             self.add_item(btn)
+        edit = discord.ui.Button(label="✏️ Edit title", row=2, style=discord.ButtonStyle.secondary, disabled=not have)
+        edit.callback = self._edit_cb
+        self.add_item(edit)
+        delete = discord.ui.Button(label="🗑️ Delete", row=2, style=discord.ButtonStyle.secondary, disabled=not have)
+        delete.callback = self._delete_cb
+        self.add_item(delete)
+        if self.confirming:                      # replace everything with the yes/no
+            self.clear_items()
+            yes = discord.ui.Button(label="Yes, delete it", row=0, style=discord.ButtonStyle.danger)
+            yes.callback = self._confirm_delete_cb
+            no = discord.ui.Button(label="Keep it", row=0, style=discord.ButtonStyle.secondary)
+            no.callback = self._cancel_delete_cb
+            self.add_item(yes)
+            self.add_item(no)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -2533,6 +2573,65 @@ class BooksView(SafeView):
                                                     ephemeral=True)
             return False
         return True
+
+    def _in_running_sprint(self, title: str) -> bool:
+        """Is this book in a sprint that's running (or collecting logs) for this person right now?"""
+        g = self.guild_id
+        for sprint in (active_sprints.get(g), self.cog._logging_sprints.get(g)):
+            data = (sprint or {}).get("participants", {}).get(self.owner_id)
+            if data and (data.get("title") or "").lower() == title.lower():
+                return True
+        return False
+
+    def _picked(self):
+        items = self._page_items()
+        return items[self.selected] if self.selected is not None and self.selected < len(items) else None
+
+    async def _edit_cb(self, interaction: discord.Interaction):
+        book = self._picked()
+        if not book:
+            await interaction.response.send_message("Pick a book first.", ephemeral=True)
+            return
+        if self._in_running_sprint(book["title"]):
+            await interaction.response.send_message(
+                "You're using that book in the sprint that's running right now — edit it once the sprint is over.",
+                ephemeral=True)
+            return
+        await interaction.response.send_modal(BookRenameModal(self, book["title"]))
+
+    async def _delete_cb(self, interaction: discord.Interaction):
+        book = self._picked()
+        if not book:
+            await interaction.response.send_message("Pick a book first.", ephemeral=True)
+            return
+        if self._in_running_sprint(book["title"]):
+            await interaction.response.send_message(
+                "You're using that book in the sprint that's running right now — delete it once the sprint is over.",
+                ephemeral=True)
+            return
+        self.confirming = True
+        self.note = (f"⚠️ Delete **{book['title']}** from your books? It comes off this list and the join form. "
+                     f"Your logged sprints and page totals aren't touched, and sprinting with it again brings it back.")
+        await self._refresh(interaction)
+
+    async def _confirm_delete_cb(self, interaction: discord.Interaction):
+        book = self._picked()
+        self.confirming = False
+        if not book:
+            self.note = None
+            await self._refresh(interaction)
+            return
+        db = self.cog.bot.db
+        await db.hide_book(self.owner_id, self.guild_id, book["title"])
+        self.books = await db.get_user_books(self.guild_id, self.owner_id)
+        self.selected = None
+        self.note = f"🗑️ **{book['title']}** deleted from your books."
+        await self._refresh(interaction)
+
+    async def _cancel_delete_cb(self, interaction: discord.Interaction):
+        self.confirming = False
+        self.note = None
+        await self._refresh(interaction)
 
     async def _refresh(self, interaction: discord.Interaction):
         self._build()
@@ -2571,6 +2670,36 @@ class BooksView(SafeView):
                          None: f"📖 **{title}** is back on your reading list."}[status]
             await self._refresh(interaction)
         return cb
+
+
+class BookRenameModal(SafeModal):
+    def __init__(self, view: "BooksView", title: str):
+        super().__init__(title="Edit book title")
+        self.books_view, self.old_title = view, title
+        self.new_title = discord.ui.TextInput(default=title, max_length=100)
+        self.add_item(discord.ui.Label(text="Book title", component=self.new_title))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        v = self.books_view
+        new = (self.new_title.value or "").strip()
+        if not new:
+            await interaction.response.send_message("❌ A book needs a title.", ephemeral=True)
+            return
+        if v._in_running_sprint(self.old_title):
+            await interaction.response.send_message(
+                "❌ You're using that book in the sprint that's running right now — edit it once it's over.",
+                ephemeral=True)
+            return
+        db = v.cog.bot.db
+        if not await db.rename_book(v.owner_id, v.guild_id, self.old_title, new):
+            await interaction.response.send_message(
+                f"❌ You already have a book called **{new}**. Pick a different title.", ephemeral=True)
+            return
+        v.books = await db.get_user_books(v.guild_id, v.owner_id)
+        v.selected = None
+        v.note = (f"✏️ Renamed to **{new}**." if new != self.old_title
+                  else "Nothing to change — that's already the title.")
+        await v._refresh(interaction)
 
 
 _USER_REF = re.compile(r"<@!?(\d{15,25})>|(\d{15,25})")

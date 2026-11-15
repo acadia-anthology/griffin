@@ -885,9 +885,9 @@ async def help_command(interaction: discord.Interaction):
             "and edit its bio, genres, and checked-out books",
             "**/race start** `<duration_minutes> [countdown_seconds]` — Start a reading/writing sprint (anyone can)",
             "**/race stats** `[member]` — View sprint stats for yourself or another member",
-            "**/race leaderboard** — View the sprint leaderboard",
+            "**/race leaderboard** `[unlogged_sprints]` — View the sprint leaderboard, or who has the most unlogged sprints",
             "**/race edit** — Edit or delete one of your sprint logs",
-            "**/race books** — See all your books (newest first) and mark them completed or DNF",
+            "**/race books** — See all your books (newest first); mark them completed or DNF, rename or delete them",
         ])
     )
     await interaction.response.send_message(embed=embed)
