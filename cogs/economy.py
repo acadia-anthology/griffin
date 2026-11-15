@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 
 from utils import cards, levels
 from utils.emoji_images import compress_emoji
-from utils.emojis import _FALLBACKS, emoji as _emoji
+from utils.emojis import _FALLBACKS, emoji as _emoji, load_application_emojis
 
 VOICE_TICK_MINUTES = 5
 
@@ -728,6 +728,10 @@ class EmojiGroup(GriffinModGroup):
 
     @app_commands.command(name="list", description="See Griffin's emojis and which ones it's missing.")
     async def list_(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        fresh = await load_application_emojis(interaction.client)       # also picks up newly uploaded emojis
+        if fresh:
+            interaction.client.app_emojis = fresh
         registry = interaction.client.app_emojis
         lines = [f"{e} `{n}`" + (" — used by Griffin" if n in _FALLBACKS else "")
                  for n, e in sorted(registry.items())]
@@ -738,7 +742,7 @@ class EmojiGroup(GriffinModGroup):
         if missing:
             text += ("\n\n**Griffin expects these but doesn't have them** (using a basic emoji): "
                      + ", ".join(f"`{n}`" for n in missing))
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(title=f"Griffin's emojis ({len(registry)})", description=text,
                                 color=discord.Color(0x26878D)), ephemeral=True)
 

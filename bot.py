@@ -1,6 +1,6 @@
 import traceback
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import asyncio
 import os
 from dotenv import load_dotenv
@@ -52,6 +52,7 @@ class Griffin(commands.Bot):
         await self.db.initialize()
         self.app_emojis = await load_application_emojis(self)
         print(f"✅ Loaded {len(self.app_emojis)} application emojis")
+        self.refresh_emojis.start()
         cogs = [
             "cogs.core",
             "cogs.economy",
@@ -62,6 +63,17 @@ class Griffin(commands.Bot):
             print(f"✅ Loaded {cog}")
         await self.tree.sync()
         print("✅ Slash commands synced")
+
+    @tasks.loop(minutes=10)
+    async def refresh_emojis(self):
+        """Emojis uploaded to the bot after startup show up on their own, without a restart."""
+        fresh = await load_application_emojis(self)
+        if fresh:                    # a failed fetch returns {}: keep what we have rather than wiping it
+            self.app_emojis = fresh
+
+    @refresh_emojis.before_loop
+    async def _before_refresh_emojis(self):
+        await asyncio.sleep(600)     # setup_hook just loaded them
 
     async def on_ready(self):
         print(f"✨ Griffin is online as {self.user} (ID: {self.user.id})", flush=True)
